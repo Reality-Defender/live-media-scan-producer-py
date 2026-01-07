@@ -1,9 +1,10 @@
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import os
 from dotenv import load_dotenv
 import websockets
+import wave
 
 from .types import StartRequest, StopRequest, SourceIds, Metadata, Properties, StartRequestPayload, \
     StopRequestPayload
@@ -108,21 +109,29 @@ async def main():
             )
         )
 
-        await ws.send(json.dumps(start_request))
+    await ws.send(json.dumps(asdict(start_request)))
 
-        stream_id = await read_start_response(ws)
+    stream_id = await read_start_response(ws)
 
-        #
-        # TODO: some streaming here.
-        #
+    # Read and stream WAV file in chunks
+    import wave
 
-        stop_request = StopRequest(
-            stream_id=stream_id,
-            payload=StopRequestPayload(reason="Normal"),
-        )
+    with wave.open("audio.wav", "rb") as wav_file:
+        chunk_size = 1024  # bytes
+        while True:
+            frames = wav_file.readframes(chunk_size // wav_file.getsampwidth())
+            if not frames:
+                break
+            await ws.send(frames)
+            await asyncio.sleep(0.01)  # Small delay for real-time simulation
 
-        await ws.send(json.dumps(stop_request))
-        await read_stop_response(ws)
+    stop_request = StopRequest(
+        stream_id=stream_id,
+        payload=StopRequestPayload(reason="Normal"),
+    )
+
+    await ws.send(json.dumps(asdict(stop_request)))
+    await read_stop_response(ws)
 
 
 if __name__ == "__main__":
