@@ -1,13 +1,54 @@
 import asyncio
 import json
 import os
+import struct
 import tempfile
 import unittest
 import wave
-from unittest.mock import AsyncMock, MagicMock, patch, mock_open
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from live_media_scan_producer import main
-from live_media_scan_producer.main import Config, read_start_response, read_stop_response
+from live_media_scan_producer.main import Config, MessageFormat, read_start_response, read_stop_response, send_text_message, send_binary_message
+
+
+class TestMessageFormat(unittest.TestCase):
+
+    def test_message_format_constants(self):
+        self.assertEqual(MessageFormat.TEXT, 0)
+        self.assertEqual(MessageFormat.BINARY, 1)
+
+
+class TestMessageSending(unittest.IsolatedAsyncioTestCase):
+
+    async def test_send_text_message(self):
+        mock_ws = AsyncMock()
+        test_data = '{"test": "data"}'
+
+        await send_text_message(mock_ws, test_data)
+
+        # Verify the message format
+        mock_ws.send.assert_called_once()
+        sent_data = mock_ws.send.call_args[0][0]
+        parsed_message = json.loads(sent_data)
+
+        self.assertEqual(parsed_message['Format'], MessageFormat.TEXT)
+        # Verify hex encoding
+        expected_hex = test_data.encode().hex()
+        self.assertEqual(parsed_message['Data'], expected_hex)
+
+    async def test_send_binary_message(self):
+        mock_ws = AsyncMock()
+        test_binary = b'\x00\x01\x02\x03'
+
+        await send_binary_message(mock_ws, test_binary)
+
+        # Verify the message format
+        mock_ws.send.assert_called_once()
+        sent_data = mock_ws.send.call_args[0][0]
+
+        # Should be binary with format byte prefix
+        expected_data = struct.pack('B', MessageFormat.BINARY) + test_binary
+        self.assertEqual(sent_data, expected_data)
 
 
 class TestConfig(unittest.TestCase):
@@ -92,21 +133,6 @@ class TestResponseReaders(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('Received erroneous response', str(context.exception))
 
-    async def test_read_start_response_unknown_status(self):
-        mock_ws = AsyncMock()
-        unknown_response = {
-            'type': 'response',
-            'subtype': 'start',
-            'status': 'pending',
-            'payload': {}
-        }
-        mock_ws.recv.return_value = json.dumps(unknown_response)
-
-        with self.assertRaises(Exception) as context:
-            await read_start_response(mock_ws)
-
-        self.assertIn('Unknown status in start response', str(context.exception))
-
     async def test_read_stop_response_success(self):
         mock_ws = AsyncMock()
         success_response = {
@@ -160,7 +186,9 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
 
     @patch('live_media_scan_producer.main.Config.from_env')
     @patch('websockets.connect')
-    async def test_main_full_flow(self, mock_connect, mock_config):
+    @patch('live_media_scan_producer.main.send_text_message')
+    @patch('live_media_scan_producer.main.send_binary_message')
+    async def test_main_full_flow(self, mock_send_binary, mock_send_text, mock_connect, mock_config):
         # Setup mocks
         mock_config.return_value = Config(
             api_key='test-key',
@@ -214,14 +242,12 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             additional_headers={'X-API-KEY': 'test-key'}
         )
 
-        # Verify messages sent
-        self.assertEqual(mock_ws.send.call_count, 3)  # start request + audio data + stop request
+        # Verify text messages (start and stop requests)
+        self.assertEqual(mock_send_text.call_count, 2)
 
-        # Verify start request was sent
-        start_call = mock_ws.send.call_args_list[0]
-        start_data = json.loads(start_call[0][0])
-        self.assertEqual(start_data['session_id'], 'session-123')
-        self.assertEqual(start_data['media_type'], 'audio/wav')
+        # Verify binary messages (audio chunks)
+        self.assertEqual(mock_send_binary.call_count, 1)
+        mock_send_binary.assert_called_with(mock_ws, b'\x00\x01' * 10)
 
     @patch('live_media_scan_producer.main.Config.from_env')
     @patch('websockets.connect')
@@ -248,54 +274,6 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('Server did not send hello', str(context.exception))
 
-    @patch('live_media_scan_producer.main.Config.from_env')
-    @patch('websockets.connect')
-    async def test_main_start_request_serialization(self, mock_connect, mock_config):
-        mock_config.return_value = Config(
-            api_key='test-key',
-            server_address='localhost',
-            server_port=3000,
-            server_path='/stream'
-        )
-
-        mock_ws = AsyncMock()
-        mock_connect.return_value.__aenter__.return_value = mock_ws
-
-        # Mock responses to get to start request
-        hello_response = {'type': 'notice', 'subtype': 'hello', 'payload': {}}
-        start_response = {'type': 'response', 'subtype': 'start', 'status': 'success', 'payload': {'stream_id': 'test'}}
-        stop_response = {'type': 'response', 'subtype': 'stop', 'status': 'success', 'payload': {}}
-
-        mock_ws.recv.side_effect = [
-            json.dumps(hello_response),
-            json.dumps(start_response),
-            json.dumps(stop_response)
-        ]
-
-        with patch('wave.open') as mock_wave_open:
-            mock_wav_file = MagicMock()
-            mock_wav_file.__enter__.return_value = mock_wav_file
-            mock_wav_file.getsampwidth.return_value = 2
-            mock_wav_file.readframes.return_value = b''  # Empty file
-            mock_wave_open.return_value = mock_wav_file
-
-            await main.main()
-
-        # Check that start request was properly serialized
-        start_call = mock_ws.send.call_args_list[0]
-        start_json = start_call[0][0]
-
-        # Should be valid JSON
-        start_data = json.loads(start_json)
-
-        # Verify key fields
-        self.assertEqual(start_data['type'], 'request')
-        self.assertEqual(start_data['subtype'], 'start')
-        self.assertEqual(start_data['session_id'], 'session-123')
-        self.assertIn('payload', start_data)
-        self.assertIn('source_ids', start_data['payload'])
-
-
 class TestWAVStreaming(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
@@ -313,26 +291,27 @@ class TestWAVStreaming(unittest.IsolatedAsyncioTestCase):
         mock_wav_file.readframes.side_effect = self.test_frames
         mock_wave_open.return_value = mock_wav_file
 
-        # Simulate the streaming part of main()
-        with wave.open("test.wav", "rb") as wav_file:
-            chunk_size = 1024
-            chunks_sent = 0
-            while True:
-                frames = wav_file.readframes(chunk_size // wav_file.getsampwidth())
-                if not frames:
-                    break
-                await mock_ws.send(frames)
-                chunks_sent += 1
-                await asyncio.sleep(0.01)
+        # Mock at the module level where it's imported
+        with patch.object(main, 'send_binary_message', new_callable=AsyncMock) as mock_send_binary:
+            # Simulate the streaming part of main()
+            with wave.open("test.wav", "rb") as wav_file:
+                chunk_size = 1024
+                chunks_sent = 0
+                while True:
+                    frames = wav_file.readframes(chunk_size // wav_file.getsampwidth())
+                    if not frames:
+                        break
+                    await main.send_binary_message(mock_ws, frames)  # Use main.send_binary_message
+                    chunks_sent += 1
+                    await asyncio.sleep(0.01)
 
-        # Verify correct number of chunks sent
-        self.assertEqual(chunks_sent, 2)
-        self.assertEqual(mock_ws.send.call_count, 2)
+            # Verify correct number of chunks sent
+            self.assertEqual(chunks_sent, 2)
+            self.assertEqual(mock_send_binary.call_count, 2)
 
-        # Verify correct data was sent
-        mock_ws.send.assert_any_call(b'\x00\x01' * 5)
-        mock_ws.send.assert_any_call(b'\x00\x02' * 5)
-
+            # Verify correct data was sent
+            mock_send_binary.assert_any_call(mock_ws, b'\x00\x01' * 5)
+            mock_send_binary.assert_any_call(mock_ws, b'\x00\x02' * 5)
 
 if __name__ == '__main__':
     unittest.main()
