@@ -16,6 +16,7 @@ class Config:
     server_address: str
     server_port: int
     server_path: str
+    file_path: str
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -24,7 +25,8 @@ class Config:
             api_key=os.environ['API_KEY'],
             server_address=os.environ['SERVER_ADDRESS'],
             server_port=int(os.environ.get('SERVER_PORT', '443')),
-            server_path=os.environ['SERVER_PATH']
+            server_path=os.environ['SERVER_PATH'],
+            file_path=os.environ.get('FILE_PATH', './audio.wav')
         )
 
 
@@ -72,7 +74,7 @@ async def read_stop_response(ws) -> None:
 async def main():
     config = Config.from_env()
 
-    url = f"ws://{config.server_address}:{config.server_port}/{config.server_path}"
+    url = f"wss://{config.server_address}:{config.server_port}/{config.server_path}"
     headers = {
         'X-API-KEY': config.api_key,
         'Origin': 'https://localhost'
@@ -99,7 +101,7 @@ async def main():
                 source_ids=SourceIds(
                     phone_number="+1234567890",
                     display_name="John Doe",
-                    file_name="call-123-audio.wav",
+                    file_name=os.path.basename(config.file_path),
                     email="johndoe@example.com",
                 ),
                 metadata=Metadata(),
@@ -119,7 +121,7 @@ async def main():
         print("Beginning streaming audio...")
 
         # Read and stream WAV file in chunks
-        with wave.open("audio.wav", "rb") as wav_file:
+        with wave.open(config.file_path, "rb") as wav_file:
             chunk_size = 1024  # bytes
             while True:
                 frames = wav_file.readframes(chunk_size // wav_file.getsampwidth())
