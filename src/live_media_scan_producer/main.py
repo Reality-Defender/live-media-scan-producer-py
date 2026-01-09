@@ -23,7 +23,7 @@ class Config:
         return cls(
             api_key=os.environ['API_KEY'],
             server_address=os.environ['SERVER_ADDRESS'],
-            server_port=int(os.environ.get('SERVER_PORT', '3000')),
+            server_port=int(os.environ.get('SERVER_PORT', '443')),
             server_path=os.environ['SERVER_PATH']
         )
 
@@ -72,9 +72,10 @@ async def read_stop_response(ws) -> None:
 async def main():
     config = Config.from_env()
 
-    url = f"ws://{config.server_address}:{config.server_port}{config.server_path}"
+    url = f"ws://{config.server_address}:{config.server_port}/{config.server_path}"
     headers = {
-        'X-API-KEY': config.api_key
+        'X-API-KEY': config.api_key,
+        'Origin': 'https://localhost'
     }
 
     async with websockets.connect(url, additional_headers=headers) as ws:
@@ -104,34 +105,38 @@ async def main():
                 metadata=Metadata(),
                 properties=Properties(
                     direction="inbound",
-                    session_type="call",
+                    session_type="real_call",
                 ),
             )
         )
 
-    await ws.send(json.dumps(asdict(start_request)))
+        print("Sending start request")
 
-    stream_id = await read_start_response(ws)
+        await ws.send(json.dumps(asdict(start_request)))
 
-    # Read and stream WAV file in chunks
-    import wave
+        stream_id = await read_start_response(ws)
 
-    with wave.open("audio.wav", "rb") as wav_file:
-        chunk_size = 1024  # bytes
-        while True:
-            frames = wav_file.readframes(chunk_size // wav_file.getsampwidth())
-            if not frames:
-                break
-            await ws.send(frames)
-            await asyncio.sleep(0.01)  # Small delay for real-time simulation
+        print("Beginning streaming audio...")
 
-    stop_request = StopRequest(
-        stream_id=stream_id,
-        payload=StopRequestPayload(reason="Normal"),
-    )
+        # Read and stream WAV file in chunks
+        with wave.open("audio.wav", "rb") as wav_file:
+            chunk_size = 1024  # bytes
+            while True:
+                frames = wav_file.readframes(chunk_size // wav_file.getsampwidth())
+                if not frames:
+                    break
+                await ws.send(frames)
+                await asyncio.sleep(0.01)  # Small delay for real-time simulation
 
-    await ws.send(json.dumps(asdict(stop_request)))
-    await read_stop_response(ws)
+        print("Finished streaming audio")
+
+        stop_request = StopRequest(
+            stream_id=stream_id,
+            payload=StopRequestPayload(reason="Normal"),
+        )
+
+        await ws.send(json.dumps(asdict(stop_request)))
+        await read_stop_response(ws)
 
 
 if __name__ == "__main__":
