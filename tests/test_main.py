@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 import wave
-from unittest.mock import AsyncMock, MagicMock, patch, mock_open
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from live_media_scan_producer import main
 from live_media_scan_producer.main import Config, read_start_response, read_stop_response
@@ -37,7 +37,7 @@ class TestConfig(unittest.TestCase):
     def test_config_default_port(self, mock_load_dotenv):
         config = Config.from_env()
 
-        self.assertEqual(config.server_port, 3000)  # Default port
+        self.assertEqual(config.server_port, 443)  # Default port
 
     @patch.dict(os.environ, {}, clear=True)
     @patch('live_media_scan_producer.main.load_dotenv')
@@ -166,7 +166,8 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             api_key='test-key',
             server_address='localhost',
             server_port=3000,
-            server_path='/stream'
+            server_path='stream',
+            file_path='./audio.wav'
         )
 
         mock_ws = AsyncMock()
@@ -210,8 +211,8 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
 
         # Verify WebSocket connection
         mock_connect.assert_called_once_with(
-            'ws://localhost:3000/stream',
-            additional_headers={'X-API-KEY': 'test-key'}
+            'wss://localhost:3000/stream',
+            additional_headers={'X-API-KEY': 'test-key', 'Origin': 'https://localhost'}
         )
 
         # Verify messages sent
@@ -230,7 +231,8 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             api_key='test-key',
             server_address='localhost',
             server_port=3000,
-            server_path='/stream'
+            server_path='/stream',
+            file_path='./audio.wav'
         )
 
         mock_ws = AsyncMock()
@@ -255,7 +257,8 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             api_key='test-key',
             server_address='localhost',
             server_port=3000,
-            server_path='/stream'
+            server_path='/stream',
+            file_path='./audio.wav'
         )
 
         mock_ws = AsyncMock()
