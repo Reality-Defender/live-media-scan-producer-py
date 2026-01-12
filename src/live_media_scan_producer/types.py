@@ -43,6 +43,7 @@ class Metadata:
 class Properties:
     direction: str
     session_type: str
+    test: bool = False
 
 
 class Reason(Enum):
