@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -221,7 +222,9 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         # Verify start request was sent
         start_call = mock_ws.send.call_args_list[0]
         start_data = json.loads(start_call[0][0])
-        self.assertEqual(start_data['session_id'], 'session-123')
+        # Verify session_id is a valid UUID
+        self.assertIsInstance(start_data['session_id'], str)
+        uuid.UUID(start_data['session_id'])  # Will raise ValueError if not a valid UUID
         self.assertEqual(start_data['media_type'], 'audio/wav')
 
     @patch('live_media_scan_producer.main.Config.from_env')
@@ -294,7 +297,9 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         # Verify key fields
         self.assertEqual(start_data['type'], 'request')
         self.assertEqual(start_data['subtype'], 'start')
-        self.assertEqual(start_data['session_id'], 'session-123')
+        # Verify session_id is a valid UUID
+        self.assertIsInstance(start_data['session_id'], str)
+        uuid.UUID(start_data['session_id'])  # Will raise ValueError if not a valid UUID
         self.assertIn('payload', start_data)
         self.assertIn('source_ids', start_data['payload'])
 
