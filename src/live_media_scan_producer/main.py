@@ -56,7 +56,6 @@ class Config:
     def source_filename(self) -> str:
         return os.path.basename(self.file_path)
 
-
 async def read_start_response(ws, pending_messages: list[str] | None = None) -> str:
     if pending_messages is None:
         pending_messages = []
