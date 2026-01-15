@@ -82,8 +82,8 @@ class TestResponseReaders(unittest.IsolatedAsyncioTestCase):
     async def test_read_start_response_wrong_type(self):
         mock_ws = AsyncMock()
         wrong_response = {
-            'type': 'notice',
-            'subtype': 'hello',
+            'type': 'unexpected',
+            'subtype': 'unknown',
             'payload': {}
         }
         mock_ws.recv.return_value = json.dumps(wrong_response)
@@ -138,6 +138,20 @@ class TestResponseReaders(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('Failure while stopping the stream', str(context.exception))
 
+    async def test_read_stop_response_analysis_complete_notice(self):
+        mock_ws = AsyncMock()
+        notice_response = {
+            'type': 'notice',
+            'subtype': 'analysis_complete',
+            'stream_id': 'stream-123'
+        }
+        mock_ws.recv.return_value = json.dumps(notice_response)
+
+        # Should not raise an exception
+        await read_stop_response(mock_ws)
+
+        mock_ws.recv.assert_called_once()
+
 
 class TestMainFunction(unittest.IsolatedAsyncioTestCase):
 
@@ -168,7 +182,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             server_address='localhost',
             server_port=3000,
             server_path='stream',
-            file_path='./audio.wav'
+            file_path=self.temp_wav_path
         )
 
         mock_ws = AsyncMock()
@@ -203,6 +217,8 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         with patch('wave.open') as mock_wave_open:
             mock_wav_file = MagicMock()
             mock_wav_file.__enter__.return_value = mock_wav_file
+            mock_wav_file.getframerate.return_value = 8000
+            mock_wav_file.getnchannels.return_value = 1
             mock_wav_file.getsampwidth.return_value = 2
             mock_wav_file.readframes.side_effect = [b'\x00\x01' * 10, b'']  # Two chunks then EOF
             mock_wave_open.return_value = mock_wav_file
@@ -213,7 +229,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         # Verify WebSocket connection
         mock_connect.assert_called_once_with(
             'wss://localhost:3000/stream',
-            additional_headers={'X-API-KEY': 'test-key', 'Origin': 'https://localhost'}
+            additional_headers={'X-API-KEY': 'test-key'}
         )
 
         # Verify messages sent
@@ -235,7 +251,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             server_address='localhost',
             server_port=3000,
             server_path='/stream',
-            file_path='./audio.wav'
+            file_path=self.temp_wav_path
         )
 
         mock_ws = AsyncMock()
@@ -261,7 +277,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             server_address='localhost',
             server_port=3000,
             server_path='/stream',
-            file_path='./audio.wav'
+            file_path=self.temp_wav_path
         )
 
         mock_ws = AsyncMock()
@@ -281,6 +297,8 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         with patch('wave.open') as mock_wave_open:
             mock_wav_file = MagicMock()
             mock_wav_file.__enter__.return_value = mock_wav_file
+            mock_wav_file.getframerate.return_value = 8000
+            mock_wav_file.getnchannels.return_value = 1
             mock_wav_file.getsampwidth.return_value = 2
             mock_wav_file.readframes.return_value = b''  # Empty file
             mock_wave_open.return_value = mock_wav_file
@@ -302,6 +320,113 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         uuid.UUID(start_data['session_id'])  # Will raise ValueError if not a valid UUID
         self.assertIn('payload', start_data)
         self.assertIn('source_ids', start_data['payload'])
+
+    @patch('live_media_scan_producer.main.Config.from_env')
+    @patch('websockets.connect')
+    async def test_main_analysis_complete_triggers_stop_request(self, mock_connect, mock_config):
+        mock_config.return_value = Config(
+            api_key='test-key',
+            server_address='localhost',
+            server_port=3000,
+            server_path='/stream',
+            file_path=self.temp_wav_path
+        )
+
+        mock_ws = AsyncMock()
+        mock_connect.return_value.__aenter__.return_value = mock_ws
+
+        hello_response = {'type': 'notice', 'subtype': 'hello', 'payload': {}}
+        start_response = {
+            'type': 'response',
+            'subtype': 'start',
+            'status': 'success',
+            'payload': {'stream_id': 'test-stream'}
+        }
+        analysis_complete_response = {
+            'type': 'notice',
+            'subtype': 'analysis_complete',
+            'stream_id': 'test-stream'
+        }
+        stop_response = {'type': 'response', 'subtype': 'stop', 'status': 'success', 'payload': {}}
+
+        mock_ws.recv.side_effect = [
+            json.dumps(hello_response),
+            json.dumps(start_response),
+            json.dumps(analysis_complete_response),
+            json.dumps(stop_response)
+        ]
+
+        with patch('wave.open') as mock_wave_open:
+            mock_wav_file = MagicMock()
+            mock_wav_file.__enter__.return_value = mock_wav_file
+            mock_wav_file.getframerate.return_value = 8000
+            mock_wav_file.getnchannels.return_value = 1
+            mock_wav_file.getsampwidth.return_value = 2
+            mock_wav_file.readframes.return_value = b''  # Empty file
+            mock_wave_open.return_value = mock_wav_file
+
+            await main.main()
+
+        # Ensure a stop request was sent even after analysis_complete notice.
+        stop_requests = []
+        for call in mock_ws.send.call_args_list:
+            payload = call[0][0]
+            if isinstance(payload, str):
+                data = json.loads(payload)
+                if data.get('type') == 'request' and data.get('subtype') == 'stop':
+                    stop_requests.append(data)
+
+        self.assertEqual(len(stop_requests), 1)
+
+    @patch('live_media_scan_producer.main.Config.from_env')
+    @patch('websockets.connect')
+    async def test_main_no_analysis_complete_notice(self, mock_connect, mock_config):
+        mock_config.return_value = Config(
+            api_key='test-key',
+            server_address='localhost',
+            server_port=3000,
+            server_path='/stream',
+            file_path=self.temp_wav_path
+        )
+
+        mock_ws = AsyncMock()
+        mock_connect.return_value.__aenter__.return_value = mock_ws
+
+        hello_response = {'type': 'notice', 'subtype': 'hello', 'payload': {}}
+        start_response = {
+            'type': 'response',
+            'subtype': 'start',
+            'status': 'success',
+            'payload': {'stream_id': 'test-stream'}
+        }
+        stop_response = {'type': 'response', 'subtype': 'stop', 'status': 'success', 'payload': {}}
+
+        mock_ws.recv.side_effect = [
+            json.dumps(hello_response),
+            json.dumps(start_response),
+            json.dumps(stop_response)
+        ]
+
+        with patch('wave.open') as mock_wave_open:
+            mock_wav_file = MagicMock()
+            mock_wav_file.__enter__.return_value = mock_wav_file
+            mock_wav_file.getframerate.return_value = 8000
+            mock_wav_file.getnchannels.return_value = 1
+            mock_wav_file.getsampwidth.return_value = 2
+            mock_wav_file.readframes.return_value = b''  # Empty file
+            mock_wave_open.return_value = mock_wav_file
+
+            await main.main()
+
+        stop_requests = []
+        for call in mock_ws.send.call_args_list:
+            payload = call[0][0]
+            if isinstance(payload, str):
+                data = json.loads(payload)
+                if data.get('type') == 'request' and data.get('subtype') == 'stop':
+                    stop_requests.append(data)
+
+        self.assertEqual(len(stop_requests), 1)
 
 
 class TestWAVStreaming(unittest.IsolatedAsyncioTestCase):
