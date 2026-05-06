@@ -15,7 +15,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 **Windows:**
-```powershell
+```cmd
 winget install astral-sh.uv
 ```
 
@@ -34,7 +34,7 @@ API_KEY=your-api-key
 LMS_ENDPOINT=wss://lms.example.com/ws
 ```
 
-`FILE_PATH` is optional — it defaults to `./audio.wav` if not set:
+`FILE_PATH` is optional — it defaults to `./audio.wav` if not set, and is typically overridden with --file on the command line:
 
 ```env
 API_KEY=your-api-key
