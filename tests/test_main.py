@@ -15,30 +15,47 @@ class TestConfig(unittest.TestCase):
 
     @patch.dict(os.environ, {
         'API_KEY': 'test-key-123',
-        'SERVER_ADDRESS': 'localhost',
-        'SERVER_PORT': '8080',
-        'SERVER_PATH': '/stream'
+        'LMS_ENDPOINT': 'wss://localhost:8080/stream'
     })
     @patch('live_media_scan_producer.main.load_dotenv')
     def test_config_from_env(self, mock_load_dotenv):
         config = Config.from_env()
 
         self.assertEqual(config.api_key, 'test-key-123')
-        self.assertEqual(config.server_address, 'localhost')
-        self.assertEqual(config.server_port, 8080)
-        self.assertEqual(config.server_path, '/stream')
+        self.assertEqual(config.lms_endpoint, 'wss://localhost:8080/stream')
         mock_load_dotenv.assert_called_once()
 
     @patch.dict(os.environ, {
         'API_KEY': 'test-key',
-        'SERVER_ADDRESS': 'example.com',
-        'SERVER_PATH': '/api'
+        'LMS_ENDPOINT': 'wss://example.com/ws'
     })
     @patch('live_media_scan_producer.main.load_dotenv')
-    def test_config_default_port(self, mock_load_dotenv):
+    def test_config_lms_endpoint(self, mock_load_dotenv):
         config = Config.from_env()
 
-        self.assertEqual(config.server_port, 443)  # Default port
+        self.assertEqual(config.lms_endpoint, 'wss://example.com/ws')
+
+    @patch.dict(os.environ, {
+        'API_KEY': 'test-key',
+        'SERVER_ADDRESS': 'legacy.example.com',
+        'SERVER_PORT': '8443',
+        'SERVER_PATH': 'ws'
+    })
+    @patch('live_media_scan_producer.main.load_dotenv')
+    def test_config_legacy_fallback(self, mock_load_dotenv):
+        config = Config.from_env()
+
+        self.assertEqual(config.lms_endpoint, 'wss://legacy.example.com:8443/ws')
+
+    @patch.dict(os.environ, {
+        'API_KEY': 'test-key',
+        'SERVER_ADDRESS': 'legacy.example.com',
+    })
+    @patch('live_media_scan_producer.main.load_dotenv')
+    def test_config_legacy_fallback_default_port_and_path(self, mock_load_dotenv):
+        config = Config.from_env()
+
+        self.assertEqual(config.lms_endpoint, 'wss://legacy.example.com:443/ws')
 
     @patch.dict(os.environ, {}, clear=True)
     @patch('live_media_scan_producer.main.load_dotenv')
@@ -168,6 +185,9 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             frames = b'\x00\x00' * 100  # 100 samples of silence
             wav_file.writeframes(frames)
 
+        self.mock_args = MagicMock()
+        self.mock_args.file_path = None
+
     def tearDown(self):
         # Clean up temporary file
         os.close(self.temp_wav_fd)
@@ -179,9 +199,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         # Setup mocks
         mock_config.return_value = Config(
             api_key='test-key',
-            server_address='localhost',
-            server_port=3000,
-            server_path='stream',
+            lms_endpoint='wss://localhost:3000/stream',
             file_path=self.temp_wav_path
         )
 
@@ -223,10 +241,8 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             mock_wav_file.readframes.side_effect = [b'\x00\x01' * 10, b'']  # Two chunks then EOF
             mock_wave_open.return_value = mock_wav_file
 
-            # Run main function
-            await main.main()
+            await main.main(self.mock_args)
 
-        # Verify WebSocket connection
         mock_connect.assert_called_once_with(
             'wss://localhost:3000/stream',
             additional_headers={'X-API-KEY': 'test-key'}
@@ -248,9 +264,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
     async def test_main_server_hello_error(self, mock_connect, mock_config):
         mock_config.return_value = Config(
             api_key='test-key',
-            server_address='localhost',
-            server_port=3000,
-            server_path='/stream',
+            lms_endpoint='wss://localhost:3000/stream',
             file_path=self.temp_wav_path
         )
 
@@ -265,7 +279,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         mock_ws.recv.return_value = json.dumps(wrong_response)
 
         with self.assertRaises(Exception) as context:
-            await main.main()
+            await main.main(self.mock_args)
 
         self.assertIn('Server did not send hello', str(context.exception))
 
@@ -274,9 +288,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
     async def test_main_start_request_serialization(self, mock_connect, mock_config):
         mock_config.return_value = Config(
             api_key='test-key',
-            server_address='localhost',
-            server_port=3000,
-            server_path='/stream',
+            lms_endpoint='wss://localhost:3000/stream',
             file_path=self.temp_wav_path
         )
 
@@ -303,7 +315,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             mock_wav_file.readframes.return_value = b''  # Empty file
             mock_wave_open.return_value = mock_wav_file
 
-            await main.main()
+            await main.main(self.mock_args)
 
         # Check that start request was properly serialized
         start_call = mock_ws.send.call_args_list[0]
@@ -326,9 +338,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
     async def test_main_analysis_complete_triggers_stop_request(self, mock_connect, mock_config):
         mock_config.return_value = Config(
             api_key='test-key',
-            server_address='localhost',
-            server_port=3000,
-            server_path='/stream',
+            lms_endpoint='wss://localhost:3000/stream',
             file_path=self.temp_wav_path
         )
 
@@ -365,7 +375,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             mock_wav_file.readframes.return_value = b''  # Empty file
             mock_wave_open.return_value = mock_wav_file
 
-            await main.main()
+            await main.main(self.mock_args)
 
         # Ensure a stop request was sent even after analysis_complete notice.
         stop_requests = []
@@ -383,9 +393,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
     async def test_main_no_analysis_complete_notice(self, mock_connect, mock_config):
         mock_config.return_value = Config(
             api_key='test-key',
-            server_address='localhost',
-            server_port=3000,
-            server_path='/stream',
+            lms_endpoint='wss://localhost:3000/stream',
             file_path=self.temp_wav_path
         )
 
@@ -416,7 +424,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             mock_wav_file.readframes.return_value = b''  # Empty file
             mock_wave_open.return_value = mock_wav_file
 
-            await main.main()
+            await main.main(self.mock_args)
 
         stop_requests = []
         for call in mock_ws.send.call_args_list:
