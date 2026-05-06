@@ -24,9 +24,7 @@ except Exception:
 @dataclass
 class Config:
     api_key: str
-    server_address: str
-    server_port: int
-    server_path: str
+    lms_endpoint: str
     file_path: str
     
     @property
@@ -44,11 +42,19 @@ class Config:
         # Command-line args take precedence over environment variables
         file_path = file_path or os.environ.get('FILE_PATH', './audio.wav')
 
+        if 'LMS_ENDPOINT' in os.environ:
+            lms_endpoint = os.environ['LMS_ENDPOINT']
+        elif 'SERVER_ADDRESS' in os.environ:
+            server_address = os.environ['SERVER_ADDRESS']
+            server_port = int(os.environ.get('SERVER_PORT', '443'))
+            server_path = os.environ.get('SERVER_PATH', 'ws')
+            lms_endpoint = f"wss://{server_address}:{server_port}/{server_path}"
+        else:
+            raise KeyError('LMS_ENDPOINT')
+
         return cls(
             api_key=os.environ['API_KEY'],
-            server_address=os.environ['SERVER_ADDRESS'],
-            server_port=int(os.environ.get('SERVER_PORT', '443')),
-            server_path=os.environ['SERVER_PATH'],
+            lms_endpoint=lms_endpoint,
             file_path=file_path
         )
 
@@ -301,14 +307,12 @@ def parse_args():
         epilog="""
 Environment variables (loaded from .env file):
   API_KEY          - API key for authentication (required)
-  SERVER_ADDRESS   - LMS server address (required)
-  SERVER_PATH      - WebSocket path (required)
-  SERVER_PORT      - Server port (default: 443)
+  LMS_ENDPOINT     - Full WebSocket URL (required, e.g. wss://lms.example.com/ws)
   FILE_PATH        - Path to audio file (default: ./audio.wav)
 
 Media type is automatically detected from file extension:
-  - Files ending in .wav → audio/wav
-  - All other files → audio/basic (raw μ-law)
+  - Files ending in .wav  -> audio/wav
+  - All other files       -> audio/basic (raw u-law)
         """
     )
     parser.add_argument(
@@ -319,13 +323,12 @@ Media type is automatically detected from file extension:
     return parser.parse_args()
 
 
-async def main():
-    args = parse_args()
+async def main(args):
     config = Config.from_env(
         file_path=args.file_path
     )
 
-    url = f"wss://{config.server_address}:{config.server_port}/{config.server_path}"
+    url = config.lms_endpoint
     headers = {
         'X-API-KEY': config.api_key
     }
@@ -468,4 +471,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(parse_args()))
