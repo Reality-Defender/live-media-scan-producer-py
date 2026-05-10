@@ -2,7 +2,7 @@ import unittest
 import json
 from dataclasses import asdict
 
-from live_media_scan_producer.types import StartRequest, StartRequestPayload, SourceIds, Metadata, Properties, \
+from live_media_scan_producer.models import StartRequest, StartRequestPayload, SourceIds, Metadata, Properties, \
     StopRequest, StopRequestPayload
 
 
