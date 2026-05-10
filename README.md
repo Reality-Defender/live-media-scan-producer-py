@@ -107,6 +107,56 @@ By default, the producer then queries the Session API to retrieve and display th
 ENABLE_RESULT_RETRIEVAL=false uv run python src/live_media_scan_producer
 ```
 
+## Example Output
+
+```
+$ uv run python src/live_media_scan_producer
+2026-05-09 20:52:49 INFO WebSocket connected: wss://lms.example.com/ws
+2026-05-09 20:52:49 INFO Server sent hello:
+{ ... }
+2026-05-09 20:52:49 INFO Detected media type: audio/wav (from file extension)
+2026-05-09 20:52:49 INFO WAV file properties: sample_rate=8000, channels=1, sample_width=2, calculated_bitrate=128000
+2026-05-09 20:52:49 INFO Sending start request:
+{ ... }
+2026-05-09 20:52:49 INFO Received message:
+{ ... }
+2026-05-09 20:52:49 INFO Beginning streaming audio...
+2026-05-09 20:52:57 INFO Analysis complete received; stopping media transmission.
+{
+  "stream_id": "3DVjwW2XFqB9WIxmMCRqscCLB2E",
+  "type": "notice",
+  "subtype": "analysis_complete"
+}
+2026-05-09 20:52:57 INFO Finished streaming audio
+2026-05-09 20:52:57 INFO Server approved stop of stream:
+{
+  "stream_id": "3DVjwW2XFqB9WIxmMCRqscCLB2E",
+  "total_bytes": 117760,
+  "stream_start": "2026-05-10T00:52:49.646029031Z",
+  "stream_stop": "2026-05-10T00:52:57.309626523Z"
+}
+2026-05-09 20:52:57 INFO Session results:
+{
+  "call_id": "3DVjwY322flLObss05zyWiv03BA",
+  "conclusion": "AUTHENTIC",
+  "created_at": "2026-05-10T00:52:57.253083Z",
+  "languages": [
+    {
+      "language": "english",
+      "supported": true
+    }
+  ],
+  "metadata": {},
+  "milliseconds_to_conclusion": 7478,
+  "probability": 0.0008578640117775649,
+  "session_id": "9c9daa19-a737-4196-999b-a0b58789462d",
+  "stream_id": "3DVjwW2XFqB9WIxmMCRqscCLB2E",
+  "updated_at": "2026-05-10T00:52:57.253083Z"
+}
+```
+
+In this example the LMS service reached a conclusion after ~7.5 seconds of audio. The `conclusion` field will be `AUTHENTIC`, `ARTIFICIAL`, or `INCONCLUSIVE`.
+
 ## Media Types
 
 ### `audio/wav`
