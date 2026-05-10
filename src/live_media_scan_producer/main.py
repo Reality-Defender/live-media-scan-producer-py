@@ -2,14 +2,18 @@ import asyncio
 import argparse
 import json
 from dataclasses import dataclass, asdict
+import logging
 import os
 import struct
+import urllib.error
+import urllib.parse
+import urllib.request
 from dotenv import load_dotenv
 import websockets
 import wave
 import uuid
 
-from .types import StartRequest, StopRequest, SourceIds, Metadata, Properties, StartRequestPayload, \
+from .models import StartRequest, StopRequest, SourceIds, Metadata, Properties, StartRequestPayload, \
     StopRequestPayload
 
 try:
@@ -20,13 +24,31 @@ except Exception:
     except Exception:
         ConnectionClosed = None  # type: ignore
 
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class Config:
     api_key: str
     lms_endpoint: str
     file_path: str
-    
+    enable_result_retrieval: bool = True
+
+    @property
+    def session_api_base_url(self) -> str:
+        """Derive the session API base URL from the LMS WebSocket endpoint.
+
+        Transforms e.g. wss://dev.lms.os.realitydefender.xyz:443/ws
+                     -> https://dev.session-api.os.realitydefender.xyz
+        """
+        parsed = urllib.parse.urlparse(self.lms_endpoint)
+        scheme = "https" if parsed.scheme in ("wss", "https") else "http"
+        hostname = parsed.hostname or ""
+        host = hostname.replace(".lms.", ".session-api.", 1)
+        standard_port = 443 if scheme == "https" else 80
+        netloc = f"{host}:{parsed.port}" if parsed.port and parsed.port != standard_port else host
+        return urllib.parse.urlunparse((scheme, netloc, "", "", "", ""))
+
     @property
     def media_type(self) -> str:
         """Automatically determine media type from file extension"""
@@ -36,7 +58,7 @@ class Config:
             return "audio/basic"
 
     @classmethod
-    def from_env(cls, file_path: str = None) -> 'Config':
+    def from_env(cls, file_path: str | None = None) -> 'Config':
         load_dotenv()
         
         # Command-line args take precedence over environment variables
@@ -52,22 +74,25 @@ class Config:
         else:
             raise KeyError('LMS_ENDPOINT')
 
+        enable_result_retrieval = os.environ.get('ENABLE_RESULT_RETRIEVAL', 'true').lower() in ('true', '1', 'yes')
+
         return cls(
             api_key=os.environ['API_KEY'],
             lms_endpoint=lms_endpoint,
-            file_path=file_path
+            file_path=file_path,
+            enable_result_retrieval=enable_result_retrieval,
         )
 
     @property
     def source_filename(self) -> str:
         return os.path.basename(self.file_path)
 
+
 async def read_start_response(ws, pending_messages: list[str] | None = None) -> str:
     if pending_messages is None:
         pending_messages = []
     try:
         while True:
-            # Use a timeout to detect if server is taking too long or closing
             try:
                 if pending_messages:
                     message = pending_messages.pop(0)
@@ -77,8 +102,7 @@ async def read_start_response(ws, pending_messages: list[str] | None = None) -> 
                 raise Exception("Timeout waiting for start response from server")
             except Exception as e:
                 if ConnectionClosed is not None and isinstance(e, ConnectionClosed):
-                    print(f"Connection closed while waiting for response: code={e.code}, reason={e.reason}")
-                    # Check if there's a close reason that might contain error info
+                    log.warning("Connection closed while waiting for response: code=%s, reason=%s", e.code, e.reason)
                     if e.reason:
                         raise Exception(f"Connection closed before receiving start response: code={e.code}, reason={e.reason}")
                     raise Exception(
@@ -88,31 +112,25 @@ async def read_start_response(ws, pending_messages: list[str] | None = None) -> 
                 raise
 
             packet = json.loads(message)
-            print(f"Received message: {packet}")
+            log.info("Received message:\n%s", json.dumps(packet, indent=2))
 
-            # Check if this is an error response
             if packet.get('type') == 'response' and packet.get('subtype') == 'start':
                 status = packet.get('status')
                 payload = packet.get('payload', {})
 
                 if status == 'success':
                     stream_id = payload['stream_id']
-                    print(f"Server approved the start of the stream: {payload}")
                     return stream_id
                 if status == 'fail':
-                    raise Exception(f"Failure while negotiating start: {payload}")
+                    raise Exception(f"Failure while negotiating start: {json.dumps(payload, indent=2)}")
                 raise Exception(f"Unknown status in start response: {status}")
             if packet.get('type') == 'notice':
-                # Server might send a notice before closing
-                print(f"Server sent notice: {packet}")
-                # Continue waiting for the actual response
+                log.info("Server sent notice:\n%s", json.dumps(packet, indent=2))
                 continue
 
-            # Log unexpected message
-            print(f"Received unexpected message type: {packet.get('type')}, subtype: {packet.get('subtype')}")
+            log.warning("Received unexpected message type: %s, subtype: %s", packet.get('type'), packet.get('subtype'))
             raise Exception(f"Received erroneous response: {message}")
     except Exception as e:
-        # Re-raise if it's already our custom exception
         if any(
             marker in str(e)
             for marker in (
@@ -124,7 +142,6 @@ async def read_start_response(ws, pending_messages: list[str] | None = None) -> 
             )
         ):
             raise
-        # Otherwise wrap it
         raise Exception(f"Error reading start response: {e}") from e
 
 
@@ -134,12 +151,10 @@ def get_wav_header_size(file_path: str) -> int:
     Returns the offset where audio data starts.
     """
     with open(file_path, 'rb') as f:
-        # Read RIFF header
         riff_header = f.read(12)
         if riff_header[0:4] != b'RIFF' or riff_header[8:12] != b'WAVE':
             raise ValueError(f"Not a valid WAV file: {file_path}")
         
-        # Find the 'fmt ' chunk
         while True:
             chunk_header = f.read(8)
             if not chunk_header or len(chunk_header) < 8:
@@ -151,13 +166,10 @@ def get_wav_header_size(file_path: str) -> int:
             if chunk_id == b'fmt ':
                 break
             
-            # Skip this chunk
             f.seek(chunk_size, 1)
         
-        # Skip fmt chunk
         f.seek(chunk_size, 1)
         
-        # Find the 'data' chunk
         while True:
             chunk_header = f.read(8)
             if not chunk_header or len(chunk_header) < 8:
@@ -167,10 +179,8 @@ def get_wav_header_size(file_path: str) -> int:
             chunk_size = struct.unpack('<I', chunk_header[4:8])[0]
             
             if chunk_id == b'data':
-                # Return current position (start of data chunk + 8 bytes for chunk header)
                 return f.tell()
             
-            # Skip this chunk
             f.seek(chunk_size, 1)
 
 
@@ -183,12 +193,10 @@ def parse_wav_header(file_path: str) -> tuple[int, int, int]:
         Tuple of (sample_rate, num_channels, sample_width_bytes)
     """
     with open(file_path, 'rb') as f:
-        # Read RIFF header
         riff_header = f.read(12)
         if riff_header[0:4] != b'RIFF' or riff_header[8:12] != b'WAVE':
             raise ValueError(f"Not a valid WAV file: {file_path}")
         
-        # Find the 'fmt ' chunk
         while True:
             chunk_header = f.read(8)
             if not chunk_header or len(chunk_header) < 8:
@@ -200,10 +208,8 @@ def parse_wav_header(file_path: str) -> tuple[int, int, int]:
             if chunk_id == b'fmt ':
                 break
             
-            # Skip this chunk
             f.seek(chunk_size, 1)
         
-        # Read format chunk (minimum 16 bytes for standard fmt chunk)
         if chunk_size < 16:
             raise ValueError(f"Invalid fmt chunk size: {chunk_size}")
         
@@ -211,24 +217,16 @@ def parse_wav_header(file_path: str) -> tuple[int, int, int]:
         if len(fmt_data) < 16:
             raise ValueError(f"Not enough fmt chunk data: {len(fmt_data)}")
         
-        # Parse fmt chunk
-        # Format: audioFormat (2) + numChannels (2) + sampleRate (4) + 
-        #         byteRate (4) + blockAlign (2) + bitsPerSample (2)
         format_tag = struct.unpack('<H', fmt_data[0:2])[0]
         num_channels = struct.unpack('<H', fmt_data[2:4])[0]
         sample_rate = struct.unpack('<I', fmt_data[4:8])[0]
         bits_per_sample = struct.unpack('<H', fmt_data[14:16])[0]
         
-        # Handle different format tags
-        # 1 = PCM, 7 = μ-law, 6 = A-law
         if format_tag == 7:  # WAVE_FORMAT_MULAW (G.711 μ-law)
-            # μ-law is 8-bit
             sample_width = 1
         elif format_tag == 6:  # WAVE_FORMAT_ALAW (G.711 A-law)
-            # A-law is 8-bit
             sample_width = 1
         elif format_tag == 1:  # WAVE_FORMAT_PCM
-            # PCM uses bits_per_sample from header
             sample_width = bits_per_sample // 8
         else:
             raise ValueError(f"Unsupported WAV format tag: {format_tag} (expected 1=PCM, 6=A-law, 7=μ-law)")
@@ -251,9 +249,9 @@ async def read_stop_response(ws, pending_messages: list[str] | None = None) -> N
 
         if packet.get('type') == 'notice':
             if packet.get('subtype') == 'analysis_complete':
-                print(f"Analysis complete notice received: {packet}")
+                log.info("Analysis complete notice received:\n%s", json.dumps(packet, indent=2))
                 return
-            print(f"Received notice while waiting for stop response: {packet}")
+            log.info("Received notice while waiting for stop response:\n%s", json.dumps(packet, indent=2))
             continue
 
         if packet.get('type') != 'response' or packet.get('subtype') != 'stop':
@@ -263,40 +261,97 @@ async def read_stop_response(ws, pending_messages: list[str] | None = None) -> N
         payload = packet.get('payload', {})
 
         if status == 'success':
-            print(f"Server approved the stop of the stream: {payload}")
+            log.info("Server approved stop of stream:\n%s", json.dumps(payload, indent=2))
             return
         elif status == 'fail':
-            raise Exception(f"Failure while stopping the stream: {payload}")
+            raise Exception(f"Failure while stopping the stream: {json.dumps(payload, indent=2)}")
         else:
             raise Exception("Unknown status in stop response")
 
 
-async def check_for_analysis_complete(
+async def stream_audio(
     ws,
+    audio_file,
+    chunk_size: int,
+    sleep_per_chunk: float,
     pending_messages: list[str],
-    analysis_complete_event: asyncio.Event,
-    timeout: float = 0.01
 ) -> None:
-    if analysis_complete_event.is_set() or pending_messages:
-        return
+    """Stream audio at real-time rate, stopping early if analysis_complete is received.
 
-    try:
-        message = await asyncio.wait_for(ws.recv(), timeout=timeout)
-    except asyncio.TimeoutError:
-        return
-    except Exception as e:
-        if ConnectionClosed is not None and isinstance(e, ConnectionClosed):
-            print(f"Connection closed while waiting for analysis complete notice: code={e.code}, reason={e.reason}")
+    After each chunk is sent the remaining pacing interval is spent attempting
+    to receive server messages, so analysis_complete is caught with minimal delay
+    without needing a separate concurrent task.
+    """
+    loop = asyncio.get_event_loop()
+    while True:
+        chunk = audio_file.read(chunk_size)
+        if not chunk:
             return
-        raise
+        await ws.send(chunk)
 
-    packet = json.loads(message)
-    if packet.get('type') == 'notice' and packet.get('subtype') == 'analysis_complete':
-        print(f"Analysis complete notice received: {packet}")
-        analysis_complete_event.set()
-        return
+        deadline = loop.time() + sleep_per_chunk
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                message = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            except Exception as e:
+                if ConnectionClosed is not None and isinstance(e, ConnectionClosed):
+                    log.warning("Connection closed during streaming: code=%s, reason=%s", e.code, e.reason)
+                    return
+                raise
+            packet = json.loads(message)
+            if packet.get('type') == 'notice' and packet.get('subtype') == 'analysis_complete':
+                log.info("Analysis complete received; stopping media transmission.\n%s", json.dumps(packet, indent=2))
+                return
+            log.info("Received message during streaming:\n%s", json.dumps(packet, indent=2))
+            pending_messages.append(message)
 
-    pending_messages.append(message)
+
+async def poll_and_print_session_results(
+    session_api_base_url: str,
+    api_key: str,
+    session_id: str,
+    poll_interval: float = 2.0,
+    max_attempts: int = 3,
+) -> None:
+    """Poll /stream_results until results are available, then pretty-print them.
+
+    The session API returns an empty array when results are not yet ready;
+    per the API docs, callers should wait at least 1 second before retrying.
+    """
+    url = f"{session_api_base_url}/stream_results?{urllib.parse.urlencode({'session_id': session_id})}"
+
+    def do_request() -> list:
+        req = urllib.request.Request(url, headers={"X-API-KEY": api_key})
+        with urllib.request.urlopen(req) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    loop = asyncio.get_event_loop()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            results = await loop.run_in_executor(None, do_request)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            log.error("Failed to retrieve session results (HTTP %s): %s", e.code, body)
+            return
+        except Exception as e:
+            log.error("Failed to retrieve session results: %s", e)
+            return
+
+        if results:
+            output = results[0] if len(results) == 1 else results
+            log.info("Session results:\n%s", json.dumps(output, indent=2))
+            return
+
+        if attempt < max_attempts:
+            log.info("Results not ready yet (attempt %d/%d), retrying in %ds...", attempt, max_attempts, int(poll_interval))
+            await asyncio.sleep(poll_interval)
+
+    log.warning("Session results were not available after %d attempts.", max_attempts)
 
 
 def parse_args():
@@ -306,9 +361,10 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Environment variables (loaded from .env file):
-  API_KEY          - API key for authentication (required)
-  LMS_ENDPOINT     - Full WebSocket URL (required, e.g. wss://lms.example.com/ws)
-  FILE_PATH        - Path to audio file (default: ./audio.wav)
+  API_KEY                   - API key for authentication (required)
+  LMS_ENDPOINT              - Full WebSocket URL (required, e.g. wss://lms.example.com/ws)
+  FILE_PATH                 - Path to audio file (default: ./audio.wav)
+  ENABLE_RESULT_RETRIEVAL   - Poll and pretty-print analysis results after session (default: true)
 
 Media type is automatically detected from file extension:
   - Files ending in .wav  -> audio/wav
@@ -324,6 +380,12 @@ Media type is automatically detected from file extension:
 
 
 async def main(args):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     config = Config.from_env(
         file_path=args.file_path
     )
@@ -334,7 +396,7 @@ async def main(args):
     }
 
     async with websockets.connect(url, additional_headers=headers) as ws:
-        print(f"WebSocket connected: {url}")
+        log.info("WebSocket connected: %s", url)
 
         message = await ws.recv()
         packet = json.loads(message)
@@ -342,35 +404,30 @@ async def main(args):
         if packet.get('type') != 'notice' or packet.get('subtype') != 'hello':
             raise Exception("Server did not send hello!")
 
-        print(f"Server sent hello: {packet['payload']}")
+        log.info("Server sent hello:\n%s", json.dumps(packet['payload'], indent=2))
 
-        # Generate a unique session ID
         session_id = str(uuid.uuid4())
 
-        # Calculate bitrate based on media type (auto-detected from file extension)
         media_type = config.media_type
-        print(f"Detected media type: {media_type} (from file extension)")
+        log.info("Detected media type: %s (from file extension)", media_type)
         
         if media_type == "audio/basic":
-            # audio/basic is G.711 μ-law: 8000 Hz, mono, 8-bit = 64 kbps = 8000 bytes/sec
-            calculated_bitrate = 64000  # 64 kbps
-            print(f"Using audio/basic format: bitrate={calculated_bitrate} bps (8000 bytes/sec)")
+            calculated_bitrate = 64000  # 64 kbps — G.711 μ-law: 8000 Hz, mono, 8-bit
+            log.info("Using audio/basic format: bitrate=%d bps (8000 bytes/sec)", calculated_bitrate)
         else:
-            # For audio/wav, read file properties to calculate bitrate
-            # Use manual parsing to support G.711 μ-law (format 7) which wave module doesn't support
             try:
-                # Try using wave module first (faster for PCM files)
                 with wave.open(config.file_path, "rb") as wav_file:
                     sample_rate = wav_file.getframerate()
                     num_channels = wav_file.getnchannels()
                     sample_width = wav_file.getsampwidth()
             except wave.Error:
-                # Fall back to manual parsing for formats wave doesn't support (e.g., μ-law)
                 sample_rate, num_channels, sample_width = parse_wav_header(config.file_path)
             
-            # Calculate bitrate: sample_rate * channels * bits_per_sample
             calculated_bitrate = sample_rate * num_channels * sample_width * 8
-            print(f"WAV file properties: sample_rate={sample_rate}, channels={num_channels}, sample_width={sample_width}, calculated_bitrate={calculated_bitrate}")
+            log.info(
+                "WAV file properties: sample_rate=%d, channels=%d, sample_width=%d, calculated_bitrate=%d",
+                sample_rate, num_channels, sample_width, calculated_bitrate,
+            )
 
         start_request = StartRequest(
             session_id=session_id,
@@ -394,72 +451,33 @@ async def main(args):
             )
         )
 
-        print("Sending start request")
-        
-        # Serialize the request and print it for debugging
         request_dict = asdict(start_request)
-        request_json = json.dumps(request_dict)
-        print(f"Start request JSON: {request_json}")
-        
-        await ws.send(request_json)
-        
-        # Small delay to allow server to process the request
+        log.info("Sending start request:\n%s", json.dumps(request_dict, indent=2))
+        await ws.send(json.dumps(request_dict))
+
         await asyncio.sleep(0.1)
 
         pending_messages: list[str] = []
         stream_id = await read_start_response(ws, pending_messages)
 
-        print("Beginning streaming audio...")
-        analysis_complete_event = asyncio.Event()
+        log.info("Beginning streaming audio...")
+        chunk_size = 1024
+        sleep_per_chunk = chunk_size * 8 / calculated_bitrate
 
-        # Read and stream audio file in chunks
-        if media_type == "audio/basic":
-            # For audio/basic, send raw audio data (no WAV header)
-            # If the file is a WAV file, we need to skip the header
-            with open(config.file_path, "rb") as audio_file:
-                # Check if it's a WAV file by reading the first 4 bytes
+        with open(config.file_path, "rb") as audio_file:
+            if media_type == "audio/basic":
                 header_check = audio_file.read(4)
-                audio_file.seek(0)  # Reset to beginning
-                
+                audio_file.seek(0)
                 if header_check == b'RIFF':
-                    # It's a WAV file, skip the header
                     header_size = get_wav_header_size(config.file_path)
-                    audio_file.seek(header_size)  # Skip to audio data
-                    print(f"Skipping WAV header ({header_size} bytes) for audio/basic")
+                    audio_file.seek(header_size)
+                    log.info("Skipping WAV header (%d bytes) for audio/basic", header_size)
                 else:
-                    # It's already raw audio data
-                    print("Reading raw audio data (no WAV header)")
-                
-                chunk_size = 1024  # bytes - can be any size, LMS will buffer appropriately
-                while True:
-                    await check_for_analysis_complete(ws, pending_messages, analysis_complete_event)
-                    if analysis_complete_event.is_set():
-                        print("Analysis complete received; stopping media transmission.")
-                        break
-                    chunk = audio_file.read(chunk_size)
-                    if not chunk:
-                        break
-                    await ws.send(chunk)
-                    await check_for_analysis_complete(ws, pending_messages, analysis_complete_event)
-                    await asyncio.sleep(0.01)  # Small delay for real-time simulation
-        else:
-            # For audio/wav, send the actual WAV file (including header)
-            # The LMS will parse the header and buffer to create 1-second snippets
-            with open(config.file_path, "rb") as wav_file:
-                chunk_size = 1024  # bytes - can be any size, LMS will buffer appropriately
-                while True:
-                    await check_for_analysis_complete(ws, pending_messages, analysis_complete_event)
-                    if analysis_complete_event.is_set():
-                        print("Analysis complete received; stopping media transmission.")
-                        break
-                    chunk = wav_file.read(chunk_size)
-                    if not chunk:
-                        break
-                    await ws.send(chunk)
-                    await check_for_analysis_complete(ws, pending_messages, analysis_complete_event)
-                    await asyncio.sleep(0.01)  # Small delay for real-time simulation
+                    log.info("Reading raw audio data (no WAV header)")
 
-        print("Finished streaming audio")
+            await stream_audio(ws, audio_file, chunk_size, sleep_per_chunk, pending_messages)
+
+        log.info("Finished streaming audio")
 
         stop_request = StopRequest(
             stream_id=stream_id,
@@ -468,6 +486,9 @@ async def main(args):
 
         await ws.send(json.dumps(asdict(stop_request)))
         await read_stop_response(ws, pending_messages)
+
+    if config.enable_result_retrieval:
+        await poll_and_print_session_results(config.session_api_base_url, config.api_key, session_id)
 
 
 if __name__ == "__main__":

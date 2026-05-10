@@ -71,9 +71,8 @@ class StartRequest:
     subtype: str = "start"
 
 
-@dataclass(frozen=True)
 class StartResponseStatus(Enum):
-    SUCCESS = "success",
+    SUCCESS = "success"
     FAIL = "fail"
 
 
@@ -117,7 +116,7 @@ class StopRequest:
 
 
 class StopResponseStatus(Enum):
-    SUCCESS = "success",
+    SUCCESS = "success"
     FAIL = "fail"
 
 
