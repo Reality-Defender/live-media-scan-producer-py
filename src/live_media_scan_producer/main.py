@@ -318,6 +318,9 @@ async def stream_audio(
                 reason = packet.get('payload', {}).get('reason', 'unknown')
                 log.info("Transmission stop received (reason: %s); stopping media transmission.", reason)
                 return
+            if packet.get('type') == 'notice' and packet.get('subtype') == 'analysis_complete':
+                log.info("Analysis complete received; stopping media transmission.")
+                return
             if packet.get('type') == 'notice' and packet.get('subtype') == 'delay':
                 delay_ms = packet.get('payload', {}).get('delay_ms', 0)
                 log.info("Delay requested by server: %d ms", delay_ms)
@@ -521,6 +524,8 @@ def main(args) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # websockets logs every binary frame at DEBUG — suppress it regardless of our level
+    logging.getLogger("websockets").setLevel(logging.WARNING)
 
     config, session_id = asyncio.run(_websocket_session(args))
 
