@@ -5,6 +5,7 @@ from dataclasses import dataclass, asdict
 import logging
 import os
 import struct
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -112,7 +113,7 @@ async def read_start_response(ws, pending_messages: list[str] | None = None) -> 
                 raise
 
             packet = json.loads(message)
-            log.info("Received message:\n%s", json.dumps(packet, indent=2))
+            log.debug("Received message:\n%s", json.dumps(packet, indent=2))
 
             if packet.get('type') == 'response' and packet.get('subtype') == 'start':
                 status = packet.get('status')
@@ -125,7 +126,7 @@ async def read_start_response(ws, pending_messages: list[str] | None = None) -> 
                     raise Exception(f"Failure while negotiating start: {json.dumps(payload, indent=2)}")
                 raise Exception(f"Unknown status in start response: {status}")
             if packet.get('type') == 'notice':
-                log.info("Server sent notice:\n%s", json.dumps(packet, indent=2))
+                log.debug("Server sent notice:\n%s", json.dumps(packet, indent=2))
                 continue
 
             log.warning("Received unexpected message type: %s, subtype: %s", packet.get('type'), packet.get('subtype'))
@@ -248,10 +249,15 @@ async def read_stop_response(ws, pending_messages: list[str] | None = None) -> N
         packet = json.loads(message)
 
         if packet.get('type') == 'notice':
-            if packet.get('subtype') == 'analysis_complete':
-                log.info("Analysis complete notice received:\n%s", json.dumps(packet, indent=2))
+            if packet.get('subtype') == 'transmission_stop':
+                reason = packet.get('payload', {}).get('reason', 'unknown')
+                log.info("Transmission stop received (reason: %s)", reason)
                 return
-            log.info("Received notice while waiting for stop response:\n%s", json.dumps(packet, indent=2))
+            if packet.get('subtype') == 'analysis_complete':
+                log.info("Analysis complete notice received")
+                log.debug("Analysis complete payload:\n%s", json.dumps(packet, indent=2))
+                return
+            log.debug("Received notice while waiting for stop response:\n%s", json.dumps(packet, indent=2))
             continue
 
         if packet.get('type') != 'response' or packet.get('subtype') != 'stop':
@@ -261,7 +267,11 @@ async def read_stop_response(ws, pending_messages: list[str] | None = None) -> N
         payload = packet.get('payload', {})
 
         if status == 'success':
-            log.info("Server approved stop of stream:\n%s", json.dumps(payload, indent=2))
+            log.info(
+                "Server approved stop of stream: stream_id=%s, total_bytes=%s",
+                payload.get('stream_id'), payload.get('total_bytes'),
+            )
+            log.debug("Stop response payload:\n%s", json.dumps(payload, indent=2))
             return
         elif status == 'fail':
             raise Exception(f"Failure while stopping the stream: {json.dumps(payload, indent=2)}")
@@ -304,14 +314,20 @@ async def stream_audio(
                     return
                 raise
             packet = json.loads(message)
-            if packet.get('type') == 'notice' and packet.get('subtype') == 'analysis_complete':
-                log.info("Analysis complete received; stopping media transmission.\n%s", json.dumps(packet, indent=2))
+            if packet.get('type') == 'notice' and packet.get('subtype') == 'transmission_stop':
+                reason = packet.get('payload', {}).get('reason', 'unknown')
+                log.info("Transmission stop received (reason: %s); stopping media transmission.", reason)
                 return
-            log.info("Received message during streaming:\n%s", json.dumps(packet, indent=2))
+            if packet.get('type') == 'notice' and packet.get('subtype') == 'delay':
+                delay_ms = packet.get('payload', {}).get('delay_ms', 0)
+                log.info("Delay requested by server: %d ms", delay_ms)
+                deadline += delay_ms / 1000
+                continue
+            log.debug("Received message during streaming:\n%s", json.dumps(packet, indent=2))
             pending_messages.append(message)
 
 
-async def poll_and_print_session_results(
+def poll_and_print_session_results(
     session_api_base_url: str,
     api_key: str,
     session_id: str,
@@ -325,15 +341,11 @@ async def poll_and_print_session_results(
     """
     url = f"{session_api_base_url}/stream_results?{urllib.parse.urlencode({'session_id': session_id})}"
 
-    def do_request() -> list:
-        req = urllib.request.Request(url, headers={"X-API-KEY": api_key})
-        with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    loop = asyncio.get_event_loop()
     for attempt in range(1, max_attempts + 1):
         try:
-            results = await loop.run_in_executor(None, do_request)
+            req = urllib.request.Request(url, headers={"X-API-KEY": api_key})
+            with urllib.request.urlopen(req) as response:
+                results = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             log.error("Failed to retrieve session results (HTTP %s): %s", e.code, body)
@@ -344,12 +356,18 @@ async def poll_and_print_session_results(
 
         if results:
             output = results[0] if len(results) == 1 else results
-            log.info("Session results:\n%s", json.dumps(output, indent=2))
+            if isinstance(output, dict):
+                log.info(
+                    "Session results: session_id=%s, stream_id=%s, conclusion=%s, probability=%.2f",
+                    output.get('session_id'), output.get('stream_id'),
+                    output.get('conclusion'), output.get('probability') or 0.0,
+                )
+            log.debug("Session results (full):\n%s", json.dumps(output, indent=2))
             return
 
         if attempt < max_attempts:
             log.info("Results not ready yet (attempt %d/%d), retrying in %ds...", attempt, max_attempts, int(poll_interval))
-            await asyncio.sleep(poll_interval)
+            time.sleep(poll_interval)
 
     log.warning("Session results were not available after %d attempts.", max_attempts)
 
@@ -376,16 +394,16 @@ Media type is automatically detected from file extension:
         dest='file_path',
         help='Path to audio file (overrides FILE_PATH env var)'
     )
+    parser.add_argument(
+        '--debug', '-d',
+        action='store_true',
+        help='Enable debug logging (includes full JSON message bodies)'
+    )
     return parser.parse_args()
 
 
-async def main(args):
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
+async def _websocket_session(args) -> tuple[Config, str]:
+    """Run the WebSocket streaming session and return (config, session_id)."""
     config = Config.from_env(
         file_path=args.file_path
     )
@@ -404,7 +422,8 @@ async def main(args):
         if packet.get('type') != 'notice' or packet.get('subtype') != 'hello':
             raise Exception("Server did not send hello!")
 
-        log.info("Server sent hello:\n%s", json.dumps(packet['payload'], indent=2))
+        log.info("Server sent hello")
+        log.debug("Hello payload:\n%s", json.dumps(packet['payload'], indent=2))
 
         session_id = str(uuid.uuid4())
 
@@ -452,7 +471,8 @@ async def main(args):
         )
 
         request_dict = asdict(start_request)
-        log.info("Sending start request:\n%s", json.dumps(request_dict, indent=2))
+        log.info("Sending start request")
+        log.debug("Start request:\n%s", json.dumps(request_dict, indent=2))
         await ws.send(json.dumps(request_dict))
 
         await asyncio.sleep(0.1)
@@ -460,9 +480,14 @@ async def main(args):
         pending_messages: list[str] = []
         stream_id = await read_start_response(ws, pending_messages)
 
-        log.info("Beginning streaming audio...")
+        # calculate the expected duration of the transmission as an aid to the user
         chunk_size = 1024
         sleep_per_chunk = chunk_size * 8 / calculated_bitrate
+
+        file_size = os.path.getsize(config.file_path)
+        duration_secs = int(file_size * 8 / calculated_bitrate)
+        duration_str = f"{duration_secs // 60}m {duration_secs % 60}s" if duration_secs >= 60 else f"{duration_secs}s"
+        log.info("Beginning streaming audio... (source duration: ~%s)", duration_str)
 
         with open(config.file_path, "rb") as audio_file:
             if media_type == "audio/basic":
@@ -481,15 +506,27 @@ async def main(args):
 
         stop_request = StopRequest(
             stream_id=stream_id,
-            payload=StopRequestPayload(reason="Normal"),
+            payload=StopRequestPayload(reason="NORMAL"),
         )
 
         await ws.send(json.dumps(asdict(stop_request)))
         await read_stop_response(ws, pending_messages)
 
+    return config, session_id
+
+
+def main(args) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    config, session_id = asyncio.run(_websocket_session(args))
+
     if config.enable_result_retrieval:
-        await poll_and_print_session_results(config.session_api_base_url, config.api_key, session_id)
+        poll_and_print_session_results(config.session_api_base_url, config.api_key, session_id)
 
 
 if __name__ == "__main__":
-    asyncio.run(main(parse_args()))
+    main(parse_args())

@@ -8,6 +8,7 @@ class HelloLimits:
     max_chunk_size_bytes: int
     max_response_tout_ms: int
     max_media_tout_ms: int
+    max_media_pause_tout_ms: int
     max_delay_ms: int
 
 
@@ -67,6 +68,7 @@ class StartRequest:
     session_id: str
     media_type: str
     payload: StartRequestPayload
+    version: int = 2
     type: str = "request"
     subtype: str = "start"
 
