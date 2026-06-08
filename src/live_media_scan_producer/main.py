@@ -297,7 +297,13 @@ async def stream_audio(
         chunk = audio_file.read(chunk_size)
         if not chunk:
             return
-        await ws.send(chunk)
+        try:
+            await ws.send(chunk)
+        except Exception as e:
+            if ConnectionClosed is not None and isinstance(e, ConnectionClosed):
+                log.warning("Connection closed while sending: code=%s, reason=%s", e.code, e.reason)
+                return
+            raise
 
         deadline = loop.time() + sleep_per_chunk
         while True:
@@ -398,6 +404,12 @@ Media type is automatically detected from file extension:
         help='Path to audio file (overrides FILE_PATH env var)'
     )
     parser.add_argument(
+        '--test',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Mark session as a test call, use --no-test for a real call (default: --test)'
+    )
+    parser.add_argument(
         '--debug', '-d',
         action='store_true',
         help='Enable debug logging (includes full JSON message bodies)'
@@ -410,6 +422,7 @@ async def _websocket_session(args) -> tuple[Config, str]:
     config = Config.from_env(
         file_path=args.file_path
     )
+    is_test_call = args.test
 
     url = config.lms_endpoint
     headers = {
@@ -432,6 +445,7 @@ async def _websocket_session(args) -> tuple[Config, str]:
 
         media_type = config.media_type
         log.info("Detected media type: %s (from file extension)", media_type)
+        log.info("Call type: %s", "TEST CALL" if is_test_call else "REAL CALL")
         
         if media_type == "audio/basic":
             calculated_bitrate = 64000  # 64 kbps — G.711 μ-law: 8000 Hz, mono, 8-bit
@@ -457,7 +471,7 @@ async def _websocket_session(args) -> tuple[Config, str]:
             payload=StartRequestPayload(
                 bitrate=calculated_bitrate,
                 analysis_channel="1.1",
-                primary_source_id="phone_number",
+                primary_source_id="file_name",
                 source_ids=SourceIds(
                     phone_number="+1234567890",
                     display_name="John Doe",
@@ -468,7 +482,7 @@ async def _websocket_session(args) -> tuple[Config, str]:
                 properties=Properties(
                     direction="inbound",
                     session_type="call",
-                    test=True,
+                    test=is_test_call,
                 ),
             )
         )
@@ -483,37 +497,41 @@ async def _websocket_session(args) -> tuple[Config, str]:
         pending_messages: list[str] = []
         stream_id = await read_start_response(ws, pending_messages)
 
-        # calculate the expected duration of the transmission as an aid to the user
-        chunk_size = 1024
-        sleep_per_chunk = chunk_size * 8 / calculated_bitrate
+        try:
+            # calculate the expected duration of the transmission as an aid to the user
+            chunk_size = 1024
+            sleep_per_chunk = chunk_size * 8 / calculated_bitrate
 
-        file_size = os.path.getsize(config.file_path)
-        duration_secs = int(file_size * 8 / calculated_bitrate)
-        duration_str = f"{duration_secs // 60}m {duration_secs % 60}s" if duration_secs >= 60 else f"{duration_secs}s"
-        log.info("Beginning streaming audio... (source duration: ~%s)", duration_str)
+            file_size = os.path.getsize(config.file_path)
+            duration_secs = int(file_size * 8 / calculated_bitrate)
+            duration_str = f"{duration_secs // 60}m {duration_secs % 60}s" if duration_secs >= 60 else f"{duration_secs}s"
+            log.info("Beginning streaming audio... (source duration: ~%s)", duration_str)
 
-        with open(config.file_path, "rb") as audio_file:
-            if media_type == "audio/basic":
-                header_check = audio_file.read(4)
-                audio_file.seek(0)
-                if header_check == b'RIFF':
-                    header_size = get_wav_header_size(config.file_path)
-                    audio_file.seek(header_size)
-                    log.info("Skipping WAV header (%d bytes) for audio/basic", header_size)
-                else:
-                    log.info("Reading raw audio data (no WAV header)")
+            with open(config.file_path, "rb") as audio_file:
+                if media_type == "audio/basic":
+                    header_check = audio_file.read(4)
+                    audio_file.seek(0)
+                    if header_check == b'RIFF':
+                        header_size = get_wav_header_size(config.file_path)
+                        audio_file.seek(header_size)
+                        log.info("Skipping WAV header (%d bytes) for audio/basic", header_size)
+                    else:
+                        log.info("Reading raw audio data (no WAV header)")
 
-            await stream_audio(ws, audio_file, chunk_size, sleep_per_chunk, pending_messages)
+                await stream_audio(ws, audio_file, chunk_size, sleep_per_chunk, pending_messages)
 
-        log.info("Finished streaming audio")
+            log.info("Finished streaming audio")
 
-        stop_request = StopRequest(
-            stream_id=stream_id,
-            payload=StopRequestPayload(reason="NORMAL"),
-        )
+            stop_request = StopRequest(
+                stream_id=stream_id,
+                payload=StopRequestPayload(reason="NORMAL"),
+            )
 
-        await ws.send(json.dumps(asdict(stop_request)))
-        await read_stop_response(ws, pending_messages)
+            await ws.send(json.dumps(asdict(stop_request)))
+            await read_stop_response(ws, pending_messages)
+        except Exception:
+            log.error("Error during session: session_id=%s, stream_id=%s", session_id, stream_id)
+            raise
 
     return config, session_id
 
