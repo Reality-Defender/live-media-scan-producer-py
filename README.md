@@ -109,11 +109,14 @@ uv run python src/live_media_scan_producer -f samples/sample.mp3
 uv run python src/live_media_scan_producer -f samples/sample.mp3 --bitrate 192000
 ```
 
-### Example 5: Explicit MIME type for raw telephony
+### Example 5: A-law / μ-law in a WAV container
+
+Headerless μ-law uses `audio/basic`. A-law is sent via WAV (`audio/wav`); LMS does not advertise a headerless A-law MIME type.
 
 ```bash
-uv run python src/live_media_scan_producer -f samples/sample.ulaw --mime-type audio/pcmu
-uv run python src/live_media_scan_producer -f samples/sample.alaw --mime-type audio/pcma
+uv run python src/live_media_scan_producer -f samples/sample_alaw.wav
+uv run python src/live_media_scan_producer -f samples/sample_ulaw.wav
+uv run python src/live_media_scan_producer -f samples/sample.ulaw
 ```
 
 The producer checks the chosen MIME type against the server hello `allowed_media` list and fails early if it is not advertised.
@@ -155,8 +158,7 @@ MIME type is detected from the file extension unless overridden with `--mime-typ
 | Extension | media_type (wire) |
 |---|---|
 | `.wav` | `audio/wav` |
-| `.ulaw`, `.pcmu` | `audio/basic` |
-| `.alaw`, `.pcma` | `audio/pcma` |
+| `.ulaw` | `audio/basic` |
 | `.l16`, `.pcm`, `.s16le`, `.raw` | `audio/L16` (requires `--rate`) |
 | `.mp3` | `audio/mpeg` |
 | `.aac` | `audio/aac` |
@@ -173,7 +175,7 @@ Unknown extensions require `--mime-type`.
 
 | Family | Default bitrate |
 |---|---|
-| G.711 (`audio/basic`, `audio/pcmu`, `audio/pcma`) | 64000 |
+| G.711 (`audio/basic`) | 64000 |
 | LPCM (`audio/L16`, …) | `rate * 16` (mono s16le) |
 | `audio/wav` | calculated from WAV header |
 | Compressed (mp3/aac/ogg/…) | 128000 |

@@ -27,12 +27,12 @@ echo "Output: $OUT"
 
 # WAV (PCM s16le) — canonical container sample
 ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -c:a pcm_s16le "$OUT/sample.wav"
-# WAV with μ-law payload (still audio/wav on the wire)
+# WAV with μ-law / A-law payload (still audio/wav on the wire)
 ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -c:a pcm_mulaw "$OUT/sample_ulaw.wav"
+ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -c:a pcm_alaw "$OUT/sample_alaw.wav"
 
-# Headerless G.711
+# Headerless G.711 μ-law (audio/basic). A-law is WAV-only for LMS (sample_alaw.wav).
 ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -f mulaw -ar 8000 -ac 1 "$OUT/sample.ulaw"
-ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -f alaw -ar 8000 -ac 1 "$OUT/sample.alaw"
 
 # Headerless LPCM s16le (use with --rate 8000)
 ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -f s16le -ar 8000 -ac 1 "$OUT/sample.pcm"
@@ -74,8 +74,9 @@ echo
 echo "Example producer commands:"
 cat <<'EOF'
   uv run python src/live_media_scan_producer -f samples/sample.wav
+  uv run python src/live_media_scan_producer -f samples/sample_ulaw.wav
+  uv run python src/live_media_scan_producer -f samples/sample_alaw.wav
   uv run python src/live_media_scan_producer -f samples/sample.ulaw
-  uv run python src/live_media_scan_producer -f samples/sample.alaw --mime-type audio/pcma
   uv run python src/live_media_scan_producer -f samples/sample.pcm --rate 8000
   uv run python src/live_media_scan_producer -f samples/sample.mp3
   uv run python src/live_media_scan_producer -f samples/sample.aac

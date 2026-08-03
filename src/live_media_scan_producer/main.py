@@ -30,9 +30,6 @@ log = logging.getLogger(__name__)
 EXTENSION_MEDIA_TYPES: dict[str, str] = {
     ".wav": "audio/wav",
     ".ulaw": "audio/basic",
-    ".pcmu": "audio/basic",
-    ".alaw": "audio/pcma",
-    ".pcma": "audio/pcma",
     ".l16": "audio/L16",
     ".pcm": "audio/L16",
     ".s16le": "audio/L16",
@@ -47,7 +44,7 @@ EXTENSION_MEDIA_TYPES: dict[str, str] = {
     ".mp4": "audio/mp4",
 }
 
-G711_MEDIA_TYPES = frozenset({"audio/basic", "audio/pcmu", "audio/pcma"})
+G711_MEDIA_TYPES = frozenset({"audio/basic"})
 LPCM_MEDIA_TYPES = frozenset({"audio/l16", "audio/pcm", "audio/x-l16", "audio/x-wav-lpcm"})
 COMPRESSED_MEDIA_TYPES = frozenset({
     "audio/mpeg", "audio/mp3", "audio/aac", "audio/ogg", "application/ogg",
@@ -543,8 +540,7 @@ Environment variables (loaded from .env file):
 
 Mime type is detected from file extension unless --mime-type is set:
   .wav              -> audio/wav
-  .ulaw / .pcmu     -> audio/basic
-  .alaw / .pcma     -> audio/pcma
+  .ulaw             -> audio/basic
   .l16 / .pcm / .s16le / .raw -> audio/L16 (requires --rate)
   .mp3              -> audio/mpeg
   .aac / .ogg / .opus / .flac / .amr / .m4a / .mp4 -> matching compressed type

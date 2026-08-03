@@ -78,9 +78,6 @@ class TestMimeHelpers(unittest.TestCase):
         cases = {
             "a.wav": "audio/wav",
             "a.ulaw": "audio/basic",
-            "a.pcmu": "audio/basic",
-            "a.alaw": "audio/pcma",
-            "a.pcma": "audio/pcma",
             "a.l16": "audio/L16",
             "a.pcm": "audio/L16",
             "a.s16le": "audio/L16",
@@ -125,8 +122,6 @@ class TestMimeHelpers(unittest.TestCase):
 
     def test_default_bitrate_by_family(self):
         self.assertEqual(default_bitrate("audio/basic"), 64000)
-        self.assertEqual(default_bitrate("audio/pcmu"), 64000)
-        self.assertEqual(default_bitrate("audio/pcma"), 64000)
         self.assertEqual(default_bitrate("audio/L16;rate=8000"), 128000)
         self.assertEqual(default_bitrate("audio/mpeg"), 128000)
         self.assertEqual(default_bitrate("audio/wav", wav_bitrate=256000), 256000)
@@ -134,7 +129,6 @@ class TestMimeHelpers(unittest.TestCase):
     def test_is_allowed_media_type(self):
         self.assertTrue(is_allowed_media_type("audio/L16;rate=8000", ALLOWED_MEDIA))
         self.assertTrue(is_allowed_media_type("AUDIO/WAV", ALLOWED_MEDIA))
-        self.assertFalse(is_allowed_media_type("audio/pcma", ALLOWED_MEDIA))
         self.assertFalse(is_allowed_media_type("video/mp4", ALLOWED_MEDIA))
 
 
