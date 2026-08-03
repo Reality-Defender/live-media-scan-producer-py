@@ -18,8 +18,8 @@ Generated from the repo-root `audio.wav` (30s, 8 kHz mono) via:
 | `sample.ogg` | `audio/ogg` | Vorbis in Ogg |
 | `sample.opus` | `audio/opus` | |
 | `sample.flac` | `audio/flac` | |
-| `sample.m4a` | `audio/x-m4a` | AAC, 44.1 kHz / 128 kb/s |
-| `sample.mp4` | `audio/mp4` | AAC in MP4, 44.1 kHz / 128 kb/s |
+| `sample.m4a` | `audio/x-m4a` | AAC, 44.1 kHz / 128 kb/s (`+faststart` for pipe decode) |
+| `sample.mp4` | `audio/mp4` | AAC in MP4, 44.1 kHz / 128 kb/s (`+faststart` for pipe decode) |
 
 `sample.amr` is only produced when ffmpeg has an AMR encoder.
 

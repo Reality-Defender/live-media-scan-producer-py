@@ -44,8 +44,10 @@ ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -c:a libmp3lame -b:a 128k "$
 ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -ar 44100 -c:a aac -b:a 128k -f adts "$OUT/sample.aac"
 ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -c:a flac "$OUT/sample.flac"
 ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -c:a libopus -b:a 64k "$OUT/sample.opus"
-ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -ar 44100 -c:a aac -b:a 128k "$OUT/sample.m4a"
-ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -ar 44100 -c:a aac -b:a 128k "$OUT/sample.mp4"
+# +faststart puts moov before mdat so ffmpeg can demux from a non-seekable
+# pipe (stream_worker's decode path). Default layout fails with 0 PCM on stdin.
+ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -ar 44100 -c:a aac -b:a 128k -movflags +faststart "$OUT/sample.m4a"
+ffmpeg -y -hide_banner -loglevel error -i "$SOURCE" -ar 44100 -c:a aac -b:a 128k -movflags +faststart "$OUT/sample.mp4"
 
 # Ogg container: prefer Vorbis (stereo — native vorbis is mono-hostile), else Opus-in-Ogg
 if ffmpeg -hide_banner -encoders 2>&1 | grep -q 'libvorbis'; then
