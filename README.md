@@ -51,9 +51,7 @@ FILE_PATH=./audio.wav
 | `FILE_PATH` | No | `./audio.wav` | Path to the audio file to send |
 | `ENABLE_RESULT_RETRIEVAL` | No | `true` | Fetch and display analysis results after the session (see below) |
 
-**Note:** Media type is automatically detected from the file extension:
-- Files ending in `.wav` -> `audio/wav`
-- All other files -> `audio/basic` (raw u-law)
+Mime type, sample rate, and bitrate are CLI-only (`--mime-type`, `--rate`, `--bitrate`).
 
 **Note:** The source filename sent in metadata is always the basename of `FILE_PATH`.
 
@@ -79,21 +77,46 @@ uv run python src/live_media_scan_producer --file ./audio.wav
 
 Command-line arguments take precedence over `.env` values.
 
+Ready-made example files live in [`samples/`](samples/) (regenerate with `./scripts/generate_samples.sh`).
+
 ### Example 1: Send a WAV file
 
 ```bash
-uv run python src/live_media_scan_producer --file ./audio.wav
+uv run python src/live_media_scan_producer --file samples/sample.wav
 ```
 
-### Example 2: Send audio/basic (raw u-law)
-
-Use any non-`.wav` extension and the producer automatically sends `audio/basic`:
+### Example 2: Send audio/basic (raw μ-law)
 
 ```bash
-uv run python src/live_media_scan_producer -f ./audio.ulaw
+uv run python src/live_media_scan_producer -f samples/sample.ulaw
 ```
 
-If your raw u-law audio happens to be in a WAV container, the WAV header is automatically stripped before sending.
+If your raw μ-law audio happens to be in a WAV container, the WAV header is automatically stripped before sending.
+
+### Example 3: Send headerless LPCM
+
+LPCM requires a sample rate (`rate=`). Use `--rate` or include it in `--mime-type`:
+
+```bash
+uv run python src/live_media_scan_producer -f samples/sample.pcm --rate 8000
+uv run python src/live_media_scan_producer -f samples/sample.pcm --mime-type 'audio/L16;rate=8000'
+```
+
+### Example 4: Send compressed audio (e.g. MP3)
+
+```bash
+uv run python src/live_media_scan_producer -f samples/sample.mp3
+uv run python src/live_media_scan_producer -f samples/sample.mp3 --bitrate 192000
+```
+
+### Example 5: Explicit MIME type for raw telephony
+
+```bash
+uv run python src/live_media_scan_producer -f samples/sample.ulaw --mime-type audio/pcmu
+uv run python src/live_media_scan_producer -f samples/sample.alaw --mime-type audio/pcma
+```
+
+The producer checks the chosen MIME type against the server hello `allowed_media` list and fails early if it is not advertised.
 
 ## How It Works
 
@@ -112,66 +135,67 @@ ENABLE_RESULT_RETRIEVAL=false uv run python src/live_media_scan_producer
 ```
 $ uv run python src/live_media_scan_producer
 2026-05-09 20:52:49 INFO WebSocket connected: wss://lms.example.com/ws
-2026-05-09 20:52:49 INFO Server sent hello:
-{ ... }
-2026-05-09 20:52:49 INFO Detected media type: audio/wav (from file extension)
+2026-05-09 20:52:49 INFO Server sent hello
+2026-05-09 20:52:49 INFO Resolved media type: audio/wav (from file extension)
 2026-05-09 20:52:49 INFO WAV file properties: sample_rate=8000, channels=1, sample_width=2, calculated_bitrate=128000
-2026-05-09 20:52:49 INFO Sending start request:
-{ ... }
-2026-05-09 20:52:49 INFO Received message:
-{ ... }
+2026-05-09 20:52:49 INFO Sending start request
 2026-05-09 20:52:49 INFO Beginning streaming audio...
 2026-05-09 20:52:57 INFO Analysis complete received; stopping media transmission.
-{
-  "stream_id": "3DVjwW2XFqB9WIxmMCRqscCLB2E",
-  "type": "notice",
-  "subtype": "analysis_complete"
-}
 2026-05-09 20:52:57 INFO Finished streaming audio
-2026-05-09 20:52:57 INFO Server approved stop of stream:
-{
-  "stream_id": "3DVjwW2XFqB9WIxmMCRqscCLB2E",
-  "total_bytes": 117760,
-  "stream_start": "2026-05-10T00:52:49.646029031Z",
-  "stream_stop": "2026-05-10T00:52:57.309626523Z"
-}
-2026-05-09 20:52:57 INFO Session results:
-{
-  "call_id": "3DVjwY322flLObss05zyWiv03BA",
-  "conclusion": "AUTHENTIC",
-  "created_at": "2026-05-10T00:52:57.253083Z",
-  "languages": [
-    {
-      "language": "english",
-      "supported": true
-    }
-  ],
-  "metadata": {},
-  "milliseconds_to_conclusion": 7478,
-  "probability": 0.0008578640117775649,
-  "session_id": "9c9daa19-a737-4196-999b-a0b58789462d",
-  "stream_id": "3DVjwW2XFqB9WIxmMCRqscCLB2E",
-  "updated_at": "2026-05-10T00:52:57.253083Z"
-}
+2026-05-09 20:52:57 INFO Server approved stop of stream: stream_id=..., total_bytes=117760
+2026-05-09 20:52:57 INFO Session results: session_id=..., stream_id=..., conclusion=AUTHENTIC, probability=0.00
 ```
 
 In this example the LMS service reached a conclusion after ~7.5 seconds of audio. The `conclusion` field will be `AUTHENTIC`, `ARTIFICIAL`, or `INCONCLUSIVE`.
 
 ## Media Types
 
-### `audio/wav`
-- Sends the complete WAV file including header
-- LMS parses the WAV header to detect format (PCM, μ-law, A-law)
-- Supports Linear PCM and G.711 μ-law/A-law WAV files
-- Bitrate is calculated from WAV file properties
+MIME type is detected from the file extension unless overridden with `--mime-type` / `-m`:
 
-### `audio/basic`
-- Sends raw G.711 μ-law audio data (no WAV header)
-- Fixed bitrate: 64 kbps (8000 bytes/sec)
-- If input is a WAV file, the header is automatically stripped
-- Can also use raw `.ulaw` files created with sox
+| Extension | media_type (wire) |
+|---|---|
+| `.wav` | `audio/wav` |
+| `.ulaw`, `.pcmu` | `audio/basic` |
+| `.alaw`, `.pcma` | `audio/pcma` |
+| `.l16`, `.pcm`, `.s16le`, `.raw` | `audio/L16` (requires `--rate`) |
+| `.mp3` | `audio/mpeg` |
+| `.aac` | `audio/aac` |
+| `.ogg` | `audio/ogg` |
+| `.opus` | `audio/opus` |
+| `.flac` | `audio/flac` |
+| `.amr` | `audio/amr` |
+| `.m4a` | `audio/x-m4a` |
+| `.mp4` | `audio/mp4` |
+
+Unknown extensions require `--mime-type`.
+
+### Bitrate defaults
+
+| Family | Default bitrate |
+|---|---|
+| G.711 (`audio/basic`, `audio/pcmu`, `audio/pcma`) | 64000 |
+| LPCM (`audio/L16`, …) | `rate * 16` (mono s16le) |
+| `audio/wav` | calculated from WAV header |
+| Compressed (mp3/aac/ogg/…) | 128000 |
+
+Override with `--bitrate` when needed (required by LMS for compressed types if you want a non-default pacing rate).
+
+### Streaming notes
+
+- **`audio/wav`**: sends the complete WAV file including header; LMS parses format from the header.
+- **Raw G.711 / LPCM**: sends payload bytes only; if the file starts with a RIFF/WAV header, that header is stripped.
+- **Compressed**: sends container bytes as-is for LMS/ffmpeg decode.
 
 ## Creating Audio Files
+
+Regenerate the checked-in `samples/` set from a source WAV (defaults to `./audio.wav`):
+
+```bash
+./scripts/generate_samples.sh
+./scripts/generate_samples.sh path/to/source.wav
+```
+
+Or with sox:
 
 ### Create μ-law WAV file
 
@@ -189,8 +213,8 @@ sox input_ulaw.wav -t raw output.ulaw
 sox input.wav -r 8000 -c 1 -b 8 -e mu-law -t raw output.ulaw
 ```
 
-## Supported Audio Formats
+### Create headerless LPCM (s16le)
 
-- **Linear PCM** (WAV format 1): 16-bit, 8000 Hz, mono
-- **G.711 μ-law** (WAV format 7): 8-bit, 8000 Hz, mono
-- **G.711 A-law** (WAV format 6): 8-bit, 8000 Hz, mono
+```bash
+sox input.wav -r 8000 -c 1 -e signed -b 16 -t raw output.pcm
+```

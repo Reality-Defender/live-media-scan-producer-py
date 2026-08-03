@@ -5,10 +5,137 @@ import tempfile
 import unittest
 import uuid
 import wave
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 from live_media_scan_producer import main
-from live_media_scan_producer.main import Config, read_start_response, read_stop_response
+from live_media_scan_producer.main import (
+    Config,
+    default_bitrate,
+    detect_media_type,
+    ensure_rate,
+    is_allowed_media_type,
+    media_type_base,
+    parse_media_type_rate,
+    read_start_response,
+    read_stop_response,
+    resolve_media_type,
+)
+
+ALLOWED_MEDIA = [
+    "audio/basic",
+    "audio/wav",
+    "audio/L16",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/aac",
+    "audio/flac",
+    "audio/ogg",
+    "audio/opus",
+    "audio/amr",
+    "audio/x-m4a",
+    "audio/m4a",
+    "audio/mp4",
+]
+
+
+def hello_payload(allowed_media=None):
+    return {
+        'type': 'notice',
+        'subtype': 'hello',
+        'payload': {
+            'version': 2,
+            'allowed_media': allowed_media if allowed_media is not None else ALLOWED_MEDIA,
+        },
+    }
+
+
+def configure_ws_recv(mock_ws, *messages):
+    """Return scripted messages, then TimeoutError for stream pacing waits."""
+    remaining = list(messages)
+
+    async def _recv():
+        if remaining:
+            return remaining.pop(0)
+        raise asyncio.TimeoutError()
+
+    mock_ws.recv = AsyncMock(side_effect=_recv)
+
+
+class TestMimeHelpers(unittest.TestCase):
+
+    def test_media_type_base_strips_params_and_case(self):
+        self.assertEqual(media_type_base("audio/L16;rate=8000"), "audio/l16")
+        self.assertEqual(media_type_base("  AUDIO/WAV  "), "audio/wav")
+
+    def test_parse_media_type_rate(self):
+        self.assertEqual(parse_media_type_rate("audio/L16;rate=8000"), 8000)
+        self.assertEqual(parse_media_type_rate("audio/L16; rate=16000 ; channels=1"), 16000)
+        self.assertIsNone(parse_media_type_rate("audio/basic"))
+        with self.assertRaises(ValueError):
+            parse_media_type_rate("audio/L16;rate=abc")
+
+    def test_detect_media_type_extensions(self):
+        cases = {
+            "a.wav": "audio/wav",
+            "a.ulaw": "audio/basic",
+            "a.pcmu": "audio/basic",
+            "a.alaw": "audio/pcma",
+            "a.pcma": "audio/pcma",
+            "a.l16": "audio/L16",
+            "a.pcm": "audio/L16",
+            "a.s16le": "audio/L16",
+            "a.raw": "audio/L16",
+            "a.mp3": "audio/mpeg",
+            "a.aac": "audio/aac",
+            "a.ogg": "audio/ogg",
+            "a.opus": "audio/opus",
+            "a.flac": "audio/flac",
+            "a.amr": "audio/amr",
+            "a.m4a": "audio/x-m4a",
+            "a.mp4": "audio/mp4",
+        }
+        for path, expected in cases.items():
+            self.assertEqual(detect_media_type(path), expected, path)
+
+    def test_detect_media_type_unknown_extension(self):
+        with self.assertRaises(ValueError) as ctx:
+            detect_media_type("file.bin")
+        self.assertIn("--mime-type", str(ctx.exception))
+
+    def test_ensure_rate_appends_and_requires(self):
+        self.assertEqual(ensure_rate("audio/L16", 8000), "audio/L16;rate=8000")
+        self.assertEqual(ensure_rate("audio/L16;rate=16000", 8000), "audio/L16;rate=16000")
+        self.assertEqual(ensure_rate("audio/basic", None), "audio/basic")
+        with self.assertRaises(ValueError):
+            ensure_rate("audio/L16", None)
+
+    def test_resolve_media_type_override_and_rate(self):
+        self.assertEqual(
+            resolve_media_type("x.bin", mime_type_override="audio/mpeg"),
+            "audio/mpeg",
+        )
+        self.assertEqual(
+            resolve_media_type("x.pcm", rate=8000),
+            "audio/L16;rate=8000",
+        )
+        self.assertEqual(
+            resolve_media_type("x.bin", mime_type_override="audio/L16;rate=16000"),
+            "audio/L16;rate=16000",
+        )
+
+    def test_default_bitrate_by_family(self):
+        self.assertEqual(default_bitrate("audio/basic"), 64000)
+        self.assertEqual(default_bitrate("audio/pcmu"), 64000)
+        self.assertEqual(default_bitrate("audio/pcma"), 64000)
+        self.assertEqual(default_bitrate("audio/L16;rate=8000"), 128000)
+        self.assertEqual(default_bitrate("audio/mpeg"), 128000)
+        self.assertEqual(default_bitrate("audio/wav", wav_bitrate=256000), 256000)
+
+    def test_is_allowed_media_type(self):
+        self.assertTrue(is_allowed_media_type("audio/L16;rate=8000", ALLOWED_MEDIA))
+        self.assertTrue(is_allowed_media_type("AUDIO/WAV", ALLOWED_MEDIA))
+        self.assertFalse(is_allowed_media_type("audio/pcma", ALLOWED_MEDIA))
+        self.assertFalse(is_allowed_media_type("video/mp4", ALLOWED_MEDIA))
 
 
 class TestConfig(unittest.TestCase):
@@ -62,6 +189,20 @@ class TestConfig(unittest.TestCase):
     def test_config_missing_env_vars(self, mock_load_dotenv):
         with self.assertRaises(KeyError):
             Config.from_env()
+
+    @patch.dict(os.environ, {
+        'API_KEY': 'test-key',
+        'LMS_ENDPOINT': 'wss://example.com/ws',
+    })
+    @patch('live_media_scan_producer.main.load_dotenv')
+    def test_config_mime_overrides_from_cli_args_only(self, mock_load_dotenv):
+        config = Config.from_env(
+            mime_type='audio/mpeg',
+            bitrate=192000,
+        )
+        self.assertEqual(config.mime_type_override, 'audio/mpeg')
+        self.assertEqual(config.bitrate, 192000)
+        self.assertEqual(config.media_type, 'audio/mpeg')
 
 
 class TestResponseReaders(unittest.IsolatedAsyncioTestCase):
@@ -187,6 +328,11 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
 
         self.mock_args = MagicMock()
         self.mock_args.file_path = None
+        self.mock_args.mime_type = None
+        self.mock_args.rate = None
+        self.mock_args.bitrate = None
+        self.mock_args.test = True
+        self.mock_args.debug = False
 
     def tearDown(self):
         # Clean up temporary file
@@ -207,11 +353,6 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         mock_connect.return_value.__aenter__.return_value = mock_ws
 
         # Mock server responses
-        hello_response = {
-            'type': 'notice',
-            'subtype': 'hello',
-            'payload': {'version': 1}
-        }
         start_response = {
             'type': 'response',
             'subtype': 'start',
@@ -225,11 +366,12 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             'payload': {'stream_id': 'stream-456', 'total_bytes': 200}
         }
 
-        mock_ws.recv.side_effect = [
-            json.dumps(hello_response),
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload()),
             json.dumps(start_response),
-            json.dumps(stop_response)
-        ]
+            json.dumps(stop_response),
+        )
 
         # Mock wave.open to use our test file
         with patch('wave.open') as mock_wave_open:
@@ -241,7 +383,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             mock_wav_file.readframes.side_effect = [b'\x00\x01' * 10, b'']  # Two chunks then EOF
             mock_wave_open.return_value = mock_wav_file
 
-            await main.main(self.mock_args)
+            await main._websocket_session(self.mock_args)
 
         mock_connect.assert_called_once_with(
             'wss://localhost:3000/stream',
@@ -279,9 +421,136 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         mock_ws.recv.return_value = json.dumps(wrong_response)
 
         with self.assertRaises(Exception) as context:
-            await main.main(self.mock_args)
+            await main._websocket_session(self.mock_args)
 
         self.assertIn('Server did not send hello', str(context.exception))
+
+    @patch('live_media_scan_producer.main.Config.from_env')
+    @patch('websockets.connect')
+    async def test_main_rejects_media_type_not_in_allowed_media(self, mock_connect, mock_config):
+        mock_config.return_value = Config(
+            api_key='test-key',
+            lms_endpoint='wss://localhost:3000/stream',
+            file_path=self.temp_wav_path,
+            mime_type_override='audio/mpeg',
+        )
+
+        mock_ws = AsyncMock()
+        mock_connect.return_value.__aenter__.return_value = mock_ws
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload(allowed_media=['audio/basic', 'audio/wav'])),
+        )
+
+        with self.assertRaises(Exception) as context:
+            await main._websocket_session(self.mock_args)
+
+        self.assertIn('not in server allowed_media', str(context.exception))
+        self.assertIn('audio/mpeg', str(context.exception))
+        mock_ws.send.assert_not_called()
+
+    @patch('live_media_scan_producer.main.Config.from_env')
+    @patch('websockets.connect')
+    async def test_main_mp3_uses_default_bitrate(self, mock_connect, mock_config):
+        mock_config.return_value = Config(
+            api_key='test-key',
+            lms_endpoint='wss://localhost:3000/stream',
+            file_path='/tmp/track.mp3',
+            mime_type_override='audio/mpeg',
+        )
+
+        mock_ws = AsyncMock()
+        mock_connect.return_value.__aenter__.return_value = mock_ws
+        start_response = {
+            'type': 'response',
+            'subtype': 'start',
+            'status': 'success',
+            'payload': {'stream_id': 'stream-mp3'}
+        }
+        stop_response = {'type': 'response', 'subtype': 'stop', 'status': 'success', 'payload': {}}
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload()),
+            json.dumps(start_response),
+            json.dumps(stop_response),
+        )
+
+        with patch('builtins.open', mock_open(read_data=b'\xff\xfb\x90\x00' * 64)), \
+             patch('os.path.getsize', return_value=256):
+            await main._websocket_session(self.mock_args)
+
+        start_data = json.loads(mock_ws.send.call_args_list[0][0][0])
+        self.assertEqual(start_data['media_type'], 'audio/mpeg')
+        self.assertEqual(start_data['payload']['bitrate'], 128000)
+
+    @patch('live_media_scan_producer.main.Config.from_env')
+    @patch('websockets.connect')
+    async def test_main_bitrate_override(self, mock_connect, mock_config):
+        mock_config.return_value = Config(
+            api_key='test-key',
+            lms_endpoint='wss://localhost:3000/stream',
+            file_path='/tmp/track.mp3',
+            mime_type_override='audio/mpeg',
+            bitrate=192000,
+        )
+
+        mock_ws = AsyncMock()
+        mock_connect.return_value.__aenter__.return_value = mock_ws
+        start_response = {
+            'type': 'response',
+            'subtype': 'start',
+            'status': 'success',
+            'payload': {'stream_id': 'stream-mp3'}
+        }
+        stop_response = {'type': 'response', 'subtype': 'stop', 'status': 'success', 'payload': {}}
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload()),
+            json.dumps(start_response),
+            json.dumps(stop_response),
+        )
+
+        with patch('builtins.open', mock_open(read_data=b'\xff\xfb\x90\x00' * 64)), \
+             patch('os.path.getsize', return_value=256):
+            await main._websocket_session(self.mock_args)
+
+        start_data = json.loads(mock_ws.send.call_args_list[0][0][0])
+        self.assertEqual(start_data['payload']['bitrate'], 192000)
+
+    @patch('live_media_scan_producer.main.Config.from_env')
+    @patch('websockets.connect')
+    async def test_main_l16_includes_rate(self, mock_connect, mock_config):
+        mock_config.return_value = Config(
+            api_key='test-key',
+            lms_endpoint='wss://localhost:3000/stream',
+            file_path='/tmp/raw.pcm',
+            mime_type_override='audio/L16',
+            sample_rate=8000,
+        )
+
+        mock_ws = AsyncMock()
+        mock_connect.return_value.__aenter__.return_value = mock_ws
+        start_response = {
+            'type': 'response',
+            'subtype': 'start',
+            'status': 'success',
+            'payload': {'stream_id': 'stream-l16'}
+        }
+        stop_response = {'type': 'response', 'subtype': 'stop', 'status': 'success', 'payload': {}}
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload()),
+            json.dumps(start_response),
+            json.dumps(stop_response),
+        )
+
+        with patch('builtins.open', mock_open(read_data=b'\x00\x01' * 128)), \
+             patch('os.path.getsize', return_value=256):
+            await main._websocket_session(self.mock_args)
+
+        start_data = json.loads(mock_ws.send.call_args_list[0][0][0])
+        self.assertEqual(start_data['media_type'], 'audio/L16;rate=8000')
+        self.assertEqual(start_data['payload']['bitrate'], 128000)
 
     @patch('live_media_scan_producer.main.Config.from_env')
     @patch('websockets.connect')
@@ -296,15 +565,15 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         mock_connect.return_value.__aenter__.return_value = mock_ws
 
         # Mock responses to get to start request
-        hello_response = {'type': 'notice', 'subtype': 'hello', 'payload': {}}
         start_response = {'type': 'response', 'subtype': 'start', 'status': 'success', 'payload': {'stream_id': 'test'}}
         stop_response = {'type': 'response', 'subtype': 'stop', 'status': 'success', 'payload': {}}
 
-        mock_ws.recv.side_effect = [
-            json.dumps(hello_response),
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload()),
             json.dumps(start_response),
-            json.dumps(stop_response)
-        ]
+            json.dumps(stop_response),
+        )
 
         with patch('wave.open') as mock_wave_open:
             mock_wav_file = MagicMock()
@@ -315,7 +584,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             mock_wav_file.readframes.return_value = b''  # Empty file
             mock_wave_open.return_value = mock_wav_file
 
-            await main.main(self.mock_args)
+            await main._websocket_session(self.mock_args)
 
         # Check that start request was properly serialized
         start_call = mock_ws.send.call_args_list[0]
@@ -345,7 +614,6 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         mock_ws = AsyncMock()
         mock_connect.return_value.__aenter__.return_value = mock_ws
 
-        hello_response = {'type': 'notice', 'subtype': 'hello', 'payload': {}}
         start_response = {
             'type': 'response',
             'subtype': 'start',
@@ -359,12 +627,13 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         }
         stop_response = {'type': 'response', 'subtype': 'stop', 'status': 'success', 'payload': {}}
 
-        mock_ws.recv.side_effect = [
-            json.dumps(hello_response),
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload()),
             json.dumps(start_response),
             json.dumps(analysis_complete_response),
-            json.dumps(stop_response)
-        ]
+            json.dumps(stop_response),
+        )
 
         with patch('wave.open') as mock_wave_open:
             mock_wav_file = MagicMock()
@@ -375,7 +644,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             mock_wav_file.readframes.return_value = b''  # Empty file
             mock_wave_open.return_value = mock_wav_file
 
-            await main.main(self.mock_args)
+            await main._websocket_session(self.mock_args)
 
         # Ensure a stop request was sent even after analysis_complete notice.
         stop_requests = []
@@ -400,7 +669,6 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         mock_ws = AsyncMock()
         mock_connect.return_value.__aenter__.return_value = mock_ws
 
-        hello_response = {'type': 'notice', 'subtype': 'hello', 'payload': {}}
         start_response = {
             'type': 'response',
             'subtype': 'start',
@@ -409,11 +677,12 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
         }
         stop_response = {'type': 'response', 'subtype': 'stop', 'status': 'success', 'payload': {}}
 
-        mock_ws.recv.side_effect = [
-            json.dumps(hello_response),
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload()),
             json.dumps(start_response),
-            json.dumps(stop_response)
-        ]
+            json.dumps(stop_response),
+        )
 
         with patch('wave.open') as mock_wave_open:
             mock_wav_file = MagicMock()
@@ -424,7 +693,7 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
             mock_wav_file.readframes.return_value = b''  # Empty file
             mock_wave_open.return_value = mock_wav_file
 
-            await main.main(self.mock_args)
+            await main._websocket_session(self.mock_args)
 
         stop_requests = []
         for call in mock_ws.send.call_args_list:

@@ -27,6 +27,142 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
+EXTENSION_MEDIA_TYPES: dict[str, str] = {
+    ".wav": "audio/wav",
+    ".ulaw": "audio/basic",
+    ".pcmu": "audio/basic",
+    ".alaw": "audio/pcma",
+    ".pcma": "audio/pcma",
+    ".l16": "audio/L16",
+    ".pcm": "audio/L16",
+    ".s16le": "audio/L16",
+    ".raw": "audio/L16",
+    ".mp3": "audio/mpeg",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".flac": "audio/flac",
+    ".amr": "audio/amr",
+    ".m4a": "audio/x-m4a",
+    ".mp4": "audio/mp4",
+}
+
+G711_MEDIA_TYPES = frozenset({"audio/basic", "audio/pcmu", "audio/pcma"})
+LPCM_MEDIA_TYPES = frozenset({"audio/l16", "audio/pcm", "audio/x-l16", "audio/x-wav-lpcm"})
+COMPRESSED_MEDIA_TYPES = frozenset({
+    "audio/mpeg", "audio/mp3", "audio/aac", "audio/ogg", "application/ogg",
+    "audio/vorbis", "audio/opus", "audio/flac", "audio/amr",
+    "audio/x-m4a", "audio/m4a", "audio/mp4",
+})
+DEFAULT_COMPRESSED_BITRATE = 128_000
+DEFAULT_G711_BITRATE = 64_000
+
+
+def media_type_base(media_type: str) -> str:
+    """Return type/subtype lowercased, without MIME parameters."""
+    base = media_type.strip().lower()
+    if ";" in base:
+        base = base.split(";", 1)[0].strip()
+    return base
+
+
+def parse_media_type_rate(media_type: str) -> int | None:
+    """Extract rate=N from a MIME string, or None if absent."""
+    for part in media_type.split(";")[1:]:
+        part = part.strip()
+        if not part:
+            continue
+        key, _, val = part.partition("=")
+        if key.strip().lower() != "rate":
+            continue
+        val = val.strip().strip("'\"")
+        try:
+            rate = int(val)
+        except ValueError as e:
+            raise ValueError(f"invalid rate={val!r} in media_type {media_type!r}") from e
+        if rate <= 0:
+            raise ValueError(f"invalid rate={val!r} in media_type {media_type!r}")
+        return rate
+    return None
+
+
+def detect_media_type(file_path: str) -> str:
+    """Map a file extension to an LMS media type."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in EXTENSION_MEDIA_TYPES:
+        raise ValueError(
+            f"Unknown file extension {ext!r} for {file_path!r}. "
+            "Specify --mime-type explicitly."
+        )
+    return EXTENSION_MEDIA_TYPES[ext]
+
+
+def is_lpcm_family(media_type: str) -> bool:
+    return media_type_base(media_type) in LPCM_MEDIA_TYPES
+
+
+def is_g711_family(media_type: str) -> bool:
+    return media_type_base(media_type) in G711_MEDIA_TYPES
+
+
+def is_raw_pcm_family(media_type: str) -> bool:
+    """Headerless telephony or LPCM types that may need WAV-header stripping."""
+    return is_g711_family(media_type) or is_lpcm_family(media_type)
+
+
+def ensure_rate(media_type: str, rate: int | None) -> str:
+    """Ensure LPCM media types include rate=; append from rate when needed."""
+    existing = parse_media_type_rate(media_type)
+    if existing is not None:
+        return media_type
+    if rate is None:
+        if is_lpcm_family(media_type):
+            raise ValueError(
+                f"mime type {media_type!r} requires rate= "
+                "(e.g. --mime-type 'audio/L16;rate=8000' or --rate 8000)"
+            )
+        return media_type
+    if rate <= 0:
+        raise ValueError(f"rate must be a positive integer, got {rate}")
+    return f"{media_type};rate={rate}"
+
+
+def resolve_media_type(
+    file_path: str,
+    mime_type_override: str | None = None,
+    rate: int | None = None,
+) -> str:
+    """Resolve the wire media_type from override/extension and optional rate."""
+    media_type = (mime_type_override or "").strip() or detect_media_type(file_path)
+    return ensure_rate(media_type, rate)
+
+
+def is_allowed_media_type(media_type: str, allowed_media: list[str]) -> bool:
+    base = media_type_base(media_type)
+    if not base:
+        return False
+    return any(media_type_base(allowed) == base for allowed in allowed_media)
+
+
+def default_bitrate(media_type: str, wav_bitrate: int | None = None) -> int:
+    """Sensible default bitrate (bps) for pacing, by media type family."""
+    base = media_type_base(media_type)
+    if base == "audio/wav":
+        if wav_bitrate is None:
+            raise ValueError("wav_bitrate is required for audio/wav")
+        return wav_bitrate
+    if is_g711_family(media_type):
+        return DEFAULT_G711_BITRATE
+    if is_lpcm_family(media_type):
+        rate = parse_media_type_rate(media_type)
+        if rate is None:
+            raise ValueError(f"media_type {media_type!r} requires rate= for bitrate")
+        return rate * 16  # mono s16le
+    if base in COMPRESSED_MEDIA_TYPES:
+        return DEFAULT_COMPRESSED_BITRATE
+    # Unknown types still need a pacing hint for LMS
+    return DEFAULT_COMPRESSED_BITRATE
+
 
 @dataclass
 class Config:
@@ -34,6 +170,9 @@ class Config:
     lms_endpoint: str
     file_path: str
     enable_result_retrieval: bool = True
+    mime_type_override: str | None = None
+    sample_rate: int | None = None
+    bitrate: int | None = None
 
     @property
     def session_api_base_url(self) -> str:
@@ -50,19 +189,25 @@ class Config:
         netloc = f"{host}:{parsed.port}" if parsed.port and parsed.port != standard_port else host
         return urllib.parse.urlunparse((scheme, netloc, "", "", "", ""))
 
+    def resolve_media_type(self) -> str:
+        return resolve_media_type(self.file_path, self.mime_type_override, self.sample_rate)
+
     @property
     def media_type(self) -> str:
-        """Automatically determine media type from file extension"""
-        if self.file_path.lower().endswith('.wav'):
-            return "audio/wav"
-        else:
-            return "audio/basic"
+        """Resolved media type (extension or override, with rate= when needed)."""
+        return self.resolve_media_type()
 
     @classmethod
-    def from_env(cls, file_path: str | None = None) -> 'Config':
+    def from_env(
+        cls,
+        file_path: str | None = None,
+        mime_type: str | None = None,
+        sample_rate: int | None = None,
+        bitrate: int | None = None,
+    ) -> 'Config':
         load_dotenv()
-        
-        # Command-line args take precedence over environment variables
+
+        # Command-line --file takes precedence over FILE_PATH
         file_path = file_path or os.environ.get('FILE_PATH', './audio.wav')
 
         if 'LMS_ENDPOINT' in os.environ:
@@ -82,6 +227,9 @@ class Config:
             lms_endpoint=lms_endpoint,
             file_path=file_path,
             enable_result_retrieval=enable_result_retrieval,
+            mime_type_override=mime_type,
+            sample_rate=sample_rate,
+            bitrate=bitrate,
         )
 
     @property
@@ -393,15 +541,43 @@ Environment variables (loaded from .env file):
   FILE_PATH                 - Path to audio file (default: ./audio.wav)
   ENABLE_RESULT_RETRIEVAL   - Poll and pretty-print analysis results after session (default: true)
 
-Media type is automatically detected from file extension:
-  - Files ending in .wav  -> audio/wav
-  - All other files       -> audio/basic (raw u-law)
+Mime type is detected from file extension unless --mime-type is set:
+  .wav              -> audio/wav
+  .ulaw / .pcmu     -> audio/basic
+  .alaw / .pcma     -> audio/pcma
+  .l16 / .pcm / .s16le / .raw -> audio/L16 (requires --rate)
+  .mp3              -> audio/mpeg
+  .aac / .ogg / .opus / .flac / .amr / .m4a / .mp4 -> matching compressed type
+
+Examples:
+  --file audio.wav
+  --file audio.ulaw
+  --file raw.pcm --rate 8000
+  --file track.mp3
+  --file data.bin --mime-type 'audio/L16;rate=16000'
         """
     )
     parser.add_argument(
         '--file', '-f',
         dest='file_path',
         help='Path to audio file (overrides FILE_PATH env var)'
+    )
+    parser.add_argument(
+        '--mime-type', '-m',
+        dest='mime_type',
+        help='Override MIME type sent as media_type in the start request (overrides extension detection)'
+    )
+    parser.add_argument(
+        '--rate',
+        dest='rate',
+        type=int,
+        help='Sample rate (Hz) for headerless LPCM; appended as ;rate=N when missing'
+    )
+    parser.add_argument(
+        '--bitrate',
+        dest='bitrate',
+        type=int,
+        help='Bitrate override in bits/sec used for pacing (defaults by mime type)'
     )
     parser.add_argument(
         '--test',
@@ -417,12 +593,36 @@ Media type is automatically detected from file extension:
     return parser.parse_args()
 
 
+def _wav_bitrate(file_path: str) -> int:
+    try:
+        with wave.open(file_path, "rb") as wav_file:
+            sample_rate = wav_file.getframerate()
+            num_channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+    except wave.Error:
+        sample_rate, num_channels, sample_width = parse_wav_header(file_path)
+
+    calculated = sample_rate * num_channels * sample_width * 8
+    log.info(
+        "WAV file properties: sample_rate=%d, channels=%d, sample_width=%d, calculated_bitrate=%d",
+        sample_rate, num_channels, sample_width, calculated,
+    )
+    return calculated
+
+
 async def _websocket_session(args) -> tuple[Config, str]:
     """Run the WebSocket streaming session and return (config, session_id)."""
     config = Config.from_env(
-        file_path=args.file_path
+        file_path=getattr(args, 'file_path', None),
+        mime_type=getattr(args, 'mime_type', None),
+        sample_rate=getattr(args, 'rate', None),
+        bitrate=getattr(args, 'bitrate', None),
     )
     is_test_call = args.test
+
+    # Resolve media type before connecting so LPCM missing-rate fails fast.
+    media_type = config.resolve_media_type()
+    media_source = "override" if config.mime_type_override else "file extension"
 
     url = config.lms_endpoint
     headers = {
@@ -438,32 +638,38 @@ async def _websocket_session(args) -> tuple[Config, str]:
         if packet.get('type') != 'notice' or packet.get('subtype') != 'hello':
             raise Exception("Server did not send hello!")
 
+        hello_payload = packet.get('payload') or {}
         log.info("Server sent hello")
-        log.debug("Hello payload:\n%s", json.dumps(packet['payload'], indent=2))
+        log.debug("Hello payload:\n%s", json.dumps(hello_payload, indent=2))
+
+        if 'allowed_media' not in hello_payload:
+            raise Exception("Server hello did not include allowed_media")
+        allowed_media = hello_payload['allowed_media']
+        if not isinstance(allowed_media, list):
+            raise Exception("Server hello allowed_media must be a list")
+
+        if not is_allowed_media_type(media_type, allowed_media):
+            raise Exception(
+                f"Media type {media_type!r} is not in server allowed_media: {allowed_media}"
+            )
 
         session_id = str(uuid.uuid4())
-
-        media_type = config.media_type
-        log.info("Detected media type: %s (from file extension)", media_type)
+        log.info("Created session_id: %s", session_id)
+        log.info("Resolved media type: %s (from %s)", media_type, media_source)
         log.info("Call type: %s", "TEST CALL" if is_test_call else "REAL CALL")
-        
-        if media_type == "audio/basic":
-            calculated_bitrate = 64000  # 64 kbps — G.711 μ-law: 8000 Hz, mono, 8-bit
-            log.info("Using audio/basic format: bitrate=%d bps (8000 bytes/sec)", calculated_bitrate)
+
+        wav_bitrate = None
+        if media_type_base(media_type) == "audio/wav":
+            wav_bitrate = _wav_bitrate(config.file_path)
+
+        if config.bitrate is not None:
+            if config.bitrate <= 0:
+                raise ValueError(f"bitrate must be a positive integer, got {config.bitrate}")
+            calculated_bitrate = config.bitrate
+            log.info("Using bitrate override: %d bps", calculated_bitrate)
         else:
-            try:
-                with wave.open(config.file_path, "rb") as wav_file:
-                    sample_rate = wav_file.getframerate()
-                    num_channels = wav_file.getnchannels()
-                    sample_width = wav_file.getsampwidth()
-            except wave.Error:
-                sample_rate, num_channels, sample_width = parse_wav_header(config.file_path)
-            
-            calculated_bitrate = sample_rate * num_channels * sample_width * 8
-            log.info(
-                "WAV file properties: sample_rate=%d, channels=%d, sample_width=%d, calculated_bitrate=%d",
-                sample_rate, num_channels, sample_width, calculated_bitrate,
-            )
+            calculated_bitrate = default_bitrate(media_type, wav_bitrate=wav_bitrate)
+            log.info("Using bitrate: %d bps", calculated_bitrate)
 
         start_request = StartRequest(
             session_id=session_id,
@@ -496,6 +702,7 @@ async def _websocket_session(args) -> tuple[Config, str]:
 
         pending_messages: list[str] = []
         stream_id = await read_start_response(ws, pending_messages)
+        log.info("Started stream_id: %s (session_id: %s)", stream_id, session_id)
 
         try:
             # calculate the expected duration of the transmission as an aid to the user
@@ -508,13 +715,16 @@ async def _websocket_session(args) -> tuple[Config, str]:
             log.info("Beginning streaming audio... (source duration: ~%s)", duration_str)
 
             with open(config.file_path, "rb") as audio_file:
-                if media_type == "audio/basic":
+                if is_raw_pcm_family(media_type):
                     header_check = audio_file.read(4)
                     audio_file.seek(0)
                     if header_check == b'RIFF':
                         header_size = get_wav_header_size(config.file_path)
                         audio_file.seek(header_size)
-                        log.info("Skipping WAV header (%d bytes) for audio/basic", header_size)
+                        log.info(
+                            "Skipping WAV header (%d bytes) for raw media type %s",
+                            header_size, media_type,
+                        )
                     else:
                         log.info("Reading raw audio data (no WAV header)")
 
