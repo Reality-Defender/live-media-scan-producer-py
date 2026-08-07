@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 from live_media_scan_producer import main
 from live_media_scan_producer.main import (
     Config,
+    SessionError,
     default_bitrate,
     detect_media_type,
     ensure_rate,
@@ -19,6 +20,7 @@ from live_media_scan_producer.main import (
     read_start_response,
     read_stop_response,
     resolve_media_type,
+    stream_audio,
 )
 
 ALLOWED_MEDIA = [
@@ -288,7 +290,10 @@ class TestResponseReaders(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(Exception) as context:
             await read_stop_response(mock_ws)
 
-        self.assertIn('Failure while stopping the stream', str(context.exception))
+        self.assertIsInstance(context.exception, SessionError)
+        self.assertIn('Server rejected the stream', str(context.exception))
+        self.assertIn('STREAM_ERROR', str(context.exception))
+        self.assertIn('Stream not found', str(context.exception))
 
     async def test_read_stop_response_analysis_complete_notice(self):
         mock_ws = AsyncMock()
@@ -698,6 +703,178 @@ class TestMainFunction(unittest.IsolatedAsyncioTestCase):
                     stop_requests.append(data)
 
         self.assertEqual(len(stop_requests), 1)
+
+    @patch('live_media_scan_producer.main.Config.from_env')
+    @patch('websockets.connect')
+    async def test_main_connection_closed_during_stream_raises_session_error(self, mock_connect, mock_config):
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        mock_config.return_value = Config(
+            api_key='test-key',
+            lms_endpoint='wss://localhost:3000/stream',
+            file_path=self.temp_wav_path,
+            enable_result_retrieval=False,
+        )
+
+        mock_ws = AsyncMock()
+        mock_connect.return_value.__aenter__.return_value = mock_ws
+        start_response = {
+            'type': 'response',
+            'subtype': 'start',
+            'status': 'success',
+            'payload': {'stream_id': 'stream-closed'},
+        }
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload()),
+            json.dumps(start_response),
+        )
+        closed = ConnectionClosedOK(Close(1000, ""), Close(1000, ""), rcvd_then_sent=True)
+        mock_ws.send.side_effect = [
+            None,  # start request JSON
+            closed,  # first audio chunk
+        ]
+
+        with self.assertRaises(SessionError) as ctx:
+            await main._websocket_session(self.mock_args)
+
+        self.assertIn("while sending audio", str(ctx.exception))
+        stop_requests = [
+            json.loads(call[0][0])
+            for call in mock_ws.send.call_args_list
+            if isinstance(call[0][0], str)
+            and json.loads(call[0][0]).get("subtype") == "stop"
+        ]
+        self.assertEqual(stop_requests, [])
+
+    @patch('live_media_scan_producer.main.Config.from_env')
+    @patch('websockets.connect')
+    async def test_main_stop_fail_during_stream_surfaces_reason(self, mock_connect, mock_config):
+        mock_config.return_value = Config(
+            api_key='test-key',
+            lms_endpoint='wss://localhost:3000/stream',
+            file_path=self.temp_wav_path,
+            enable_result_retrieval=False,
+        )
+
+        mock_ws = AsyncMock()
+        mock_connect.return_value.__aenter__.return_value = mock_ws
+        start_response = {
+            'type': 'response',
+            'subtype': 'start',
+            'status': 'success',
+            'payload': {'stream_id': 'stream-m4a'},
+        }
+        stop_fail = {
+            'type': 'response',
+            'subtype': 'stop',
+            'status': 'fail',
+            'payload': {
+                'code': 'INVALID_REQUEST',
+                'reason': 'MP4/M4A has mdat before moov (not faststart)',
+            },
+        }
+        configure_ws_recv(
+            mock_ws,
+            json.dumps(hello_payload()),
+            json.dumps(start_response),
+            json.dumps(stop_fail),
+        )
+
+        with self.assertRaises(SessionError) as ctx:
+            await main._websocket_session(self.mock_args)
+
+        message = str(ctx.exception)
+        self.assertIn('Server rejected the stream', message)
+        self.assertIn('INVALID_REQUEST', message)
+        self.assertIn('mdat before moov', message)
+        stop_requests = [
+            json.loads(call[0][0])
+            for call in mock_ws.send.call_args_list
+            if isinstance(call[0][0], str)
+            and json.loads(call[0][0]).get('subtype') == 'stop'
+        ]
+        self.assertEqual(stop_requests, [])
+
+
+class TestStreamAudioConnectionClosed(unittest.IsolatedAsyncioTestCase):
+
+    async def test_connection_closed_while_sending_raises_session_error(self):
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        mock_ws = AsyncMock()
+        mock_ws.send.side_effect = ConnectionClosedOK(
+            Close(1000, ""), Close(1000, ""), rcvd_then_sent=True,
+        )
+        audio_file = MagicMock()
+        audio_file.read.return_value = b"\x00" * 64
+
+        with self.assertRaises(SessionError) as ctx:
+            await stream_audio(mock_ws, audio_file, chunk_size=64, sleep_per_chunk=0.0, pending_messages=[])
+
+        message = str(ctx.exception)
+        self.assertIn("Server closed the connection while sending audio", message)
+        self.assertIn("code=1000", message)
+        self.assertNotIn("fast-start", message)
+        self.assertNotIn("likely rejected", message)
+
+    async def test_connection_closed_during_recv_raises_session_error(self):
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        mock_ws = AsyncMock()
+        mock_ws.send.return_value = None
+        mock_ws.recv.side_effect = ConnectionClosedOK(
+            Close(1000, ""), Close(1000, ""), rcvd_then_sent=True,
+        )
+        audio_file = MagicMock()
+        audio_file.read.return_value = b"\x00" * 64
+
+        with self.assertRaises(SessionError) as ctx:
+            await stream_audio(mock_ws, audio_file, chunk_size=64, sleep_per_chunk=1.0, pending_messages=[])
+
+        self.assertIn("Server closed the connection during streaming", str(ctx.exception))
+
+    async def test_stop_fail_during_streaming_raises_session_error(self):
+        mock_ws = AsyncMock()
+        mock_ws.send.return_value = None
+        mock_ws.recv.return_value = json.dumps({
+            'type': 'response',
+            'subtype': 'stop',
+            'status': 'fail',
+            'payload': {
+                'code': 'INVALID_REQUEST',
+                'reason': 'MP4/M4A has mdat before moov (not faststart)',
+            },
+        })
+        audio_file = MagicMock()
+        audio_file.read.return_value = b"\x00" * 64
+
+        with self.assertRaises(SessionError) as ctx:
+            await stream_audio(mock_ws, audio_file, chunk_size=64, sleep_per_chunk=1.0, pending_messages=[])
+
+        message = str(ctx.exception)
+        self.assertIn("Server rejected the stream", message)
+        self.assertIn("INVALID_REQUEST", message)
+        self.assertIn("mdat before moov", message)
+
+    async def test_error_notice_during_streaming_raises_session_error(self):
+        mock_ws = AsyncMock()
+        mock_ws.send.return_value = None
+        mock_ws.recv.return_value = json.dumps({
+            'type': 'notice',
+            'subtype': 'error',
+            'payload': {'message': 'Media chunk exceeds the maximum size.'},
+        })
+        audio_file = MagicMock()
+        audio_file.read.return_value = b"\x00" * 64
+
+        with self.assertRaises(SessionError) as ctx:
+            await stream_audio(mock_ws, audio_file, chunk_size=64, sleep_per_chunk=1.0, pending_messages=[])
+
+        self.assertIn("Server error notice: Media chunk exceeds the maximum size.", str(ctx.exception))
 
 
 class TestWAVStreaming(unittest.IsolatedAsyncioTestCase):

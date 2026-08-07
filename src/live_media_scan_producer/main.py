@@ -5,6 +5,7 @@ from dataclasses import dataclass, asdict
 import logging
 import os
 import struct
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -26,6 +27,36 @@ except Exception:
         ConnectionClosed = None  # type: ignore
 
 log = logging.getLogger(__name__)
+
+
+class SessionError(Exception):
+    """User-facing session failure; main prints the message without a traceback."""
+
+
+def _connection_closed_message(exc, when: str) -> str:
+    rcvd = getattr(exc, "rcvd", None)
+    code = getattr(rcvd, "code", None) if rcvd is not None else getattr(exc, "code", None)
+    reason = getattr(rcvd, "reason", None) if rcvd is not None else getattr(exc, "reason", None)
+    reason = (reason or "").strip()
+    detail = f"code={code}"
+    if reason:
+        detail = f"{detail}, reason={reason}"
+    return f"Server closed the connection {when} ({detail})."
+
+
+def _format_fail_payload(payload: dict) -> str:
+    code = payload.get("code")
+    reason = payload.get("reason") or payload.get("message")
+    parts: list[str] = []
+    if code:
+        parts.append(f"code={code}")
+    if reason:
+        parts.append(str(reason))
+    return ": ".join(parts) if parts else json.dumps(payload)
+
+
+def _session_error_from_stop_fail(payload: dict) -> SessionError:
+    return SessionError(f"Server rejected the stream: {_format_fail_payload(payload)}")
 
 EXTENSION_MEDIA_TYPES: dict[str, str] = {
     ".wav": "audio/wav",
@@ -419,7 +450,7 @@ async def read_stop_response(ws, pending_messages: list[str] | None = None) -> N
             log.debug("Stop response payload:\n%s", json.dumps(payload, indent=2))
             return
         elif status == 'fail':
-            raise Exception(f"Failure while stopping the stream: {json.dumps(payload, indent=2)}")
+            raise _session_error_from_stop_fail(payload if isinstance(payload, dict) else {})
         else:
             raise Exception("Unknown status in stop response")
 
@@ -446,8 +477,7 @@ async def stream_audio(
             await ws.send(chunk)
         except Exception as e:
             if ConnectionClosed is not None and isinstance(e, ConnectionClosed):
-                log.warning("Connection closed while sending: code=%s, reason=%s", e.code, e.reason)
-                return
+                raise SessionError(_connection_closed_message(e, "while sending audio")) from None
             raise
 
         deadline = loop.time() + sleep_per_chunk
@@ -461,10 +491,18 @@ async def stream_audio(
                 break
             except Exception as e:
                 if ConnectionClosed is not None and isinstance(e, ConnectionClosed):
-                    log.warning("Connection closed during streaming: code=%s, reason=%s", e.code, e.reason)
-                    return
+                    raise SessionError(_connection_closed_message(e, "during streaming")) from None
                 raise
             packet = json.loads(message)
+            if packet.get('type') == 'response' and packet.get('subtype') == 'stop':
+                if packet.get('status') == 'fail':
+                    payload = packet.get('payload') or {}
+                    raise _session_error_from_stop_fail(payload if isinstance(payload, dict) else {})
+                pending_messages.append(message)
+                continue
+            if packet.get('type') == 'notice' and packet.get('subtype') == 'error':
+                msg = (packet.get('payload') or {}).get('message', 'unknown error')
+                raise SessionError(f"Server error notice: {msg}")
             if packet.get('type') == 'notice' and packet.get('subtype') == 'transmission_stop':
                 reason = packet.get('payload', {}).get('reason', 'unknown')
                 log.info("Transmission stop received (reason: %s); stopping media transmission.", reason)
@@ -733,8 +771,18 @@ async def _websocket_session(args) -> tuple[Config, str]:
                 payload=StopRequestPayload(reason="NORMAL"),
             )
 
-            await ws.send(json.dumps(asdict(stop_request)))
+            try:
+                await ws.send(json.dumps(asdict(stop_request)))
+            except Exception as e:
+                if ConnectionClosed is not None and isinstance(e, ConnectionClosed):
+                    raise SessionError(
+                        _connection_closed_message(e, "before stop could be sent")
+                    ) from None
+                raise
             await read_stop_response(ws, pending_messages)
+        except SessionError as e:
+            log.error("%s (session_id=%s, stream_id=%s)", e, session_id, stream_id)
+            raise
         except Exception:
             log.error("Error during session: session_id=%s, stream_id=%s", session_id, stream_id)
             raise
@@ -751,7 +799,10 @@ def main(args) -> None:
     # websockets logs every binary frame at DEBUG — suppress it regardless of our level
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
-    config, session_id = asyncio.run(_websocket_session(args))
+    try:
+        config, session_id = asyncio.run(_websocket_session(args))
+    except SessionError:
+        sys.exit(1)
 
     if config.enable_result_retrieval:
         poll_and_print_session_results(config.session_api_base_url, config.api_key, session_id)
